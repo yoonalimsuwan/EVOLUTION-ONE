@@ -71,7 +71,7 @@ drug recommendation**, all on commodity hardware.
 ## Installation
 
 ```bash
-git clone https://github.com/your-username/real-fold-one.git
+git clone https://github.com/yoonalimsuwan/EVOLUTION-ONE.git
 cd real-fold-one
 
 # Create and activate a conda environment (optional)
@@ -206,6 +206,6 @@ This project is licensed under the MIT License – see LICENSE for details.
 Contact
 
 Yoon A Limsuwan – GitHub
-Project link: https://github.com/your-username/real-fold-one
+Project link: https://github.com/yoonalimsuwan/EVOLUTION-ONE
 
 ```
