@@ -78,7 +78,7 @@ drug recommendation**, all on commodity hardware.
 
 ```bash
 git clone https://github.com/yoonalimsuwan/EVOLUTION-ONE.git
-cd real-fold-one
+cd evolution-one
 
 # Create and activate a conda environment (optional)
 conda create -n evolution python=3.10 -y
