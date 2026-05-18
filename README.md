@@ -22,20 +22,6 @@ calculations and high‑throughput mutation scanning.
 
 ---
 
-## Table of Contents
-- [Overview](#overview)
-- [Features](#features)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [Input File Formats](#input-file-formats)
-- [Output Files](#output-files)
-- [Integration with REAL FOLD ONE](#integration-with-real-fold-one)
-- [Architectural Philosophy](#architectural-philosophy)
-- [Citing Evolution ONE](#citing-evolution-one)
-- [License](#license)
-
----
-
 ## Overview
 
 Traditional cancer genomics tools classify mutations as drivers or passengers
