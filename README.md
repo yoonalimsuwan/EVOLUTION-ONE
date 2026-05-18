@@ -190,6 +190,39 @@ REAL FOLD ONE:
   ONE builds on first‑principle models (SOC, SSC, RG, BV) to interpret cancer
   as a dynamical system.
 
+### How Evolution ONE Works – The Three Evolutionary Regimes
+
+Evolution ONE models cancer progression as a **dynamical phase transition**
+driven by the accumulation of mutations. Rather than treating every tumour
+as a collection of independent random events, the engine quantifies the
+**mutation load μ** (fraction of key genes affected) and uses principles
+from **Self‑Organised Criticality (SOC)** to place each sample into one
+of three regimes:
+
+| Regime | State | μ range | Biological interpretation |
+|--------|-------|---------|---------------------------|
+| **Stable (Stochastic)** | 0 | μ < 0.2 | Mutations are sparse and effectively neutral. The system is far from a critical point and behaves as a random drift process. |
+| **Critical (Selection)** | 1 | 0.2 ≤ μ ≤ 0.8 | The tumour is at the edge of collapse. Multi‑level selection (coding + regulatory, via duons) becomes active. Small perturbations can trigger SOC‑like avalanches, generating heterogeneity. |
+| **Collapse (Deterministic)** | 2 | μ > 0.8 | The mutational load overwhelms the system. Key proteins destabilise, regulatory networks break down, and the cancer follows a deterministic trajectory toward aggressive growth or cell death. |
+
+These regimes are not merely descriptive—they are **quantified** by the
+engine:
+
+- **Entropy H** of the state distribution measures the degree of
+  heterogeneity.
+- **SOC evolution** (feedback between stress σ and temperature T) and
+  **Itô Langevin dynamics** simulate future μ, predicting whether a stable
+  or critical tumour will cross into the collapse regime.
+- **Duon disruption** (μ_duon) adds a second dimension, revealing
+  mutations that simultaneously alter protein sequence and gene
+  regulation—a hallmark of multi‑level selection.
+
+By grounding cancer evolution in SOC physics, Evolution ONE moves beyond
+the classic driver/passenger dichotomy and provides a **unified mathematical
+language** for tumour dynamics. This is the same language that describes
+earthquakes, avalanches, and financial crashes—phenomena where a critical
+state separates order from chaos.
+
 ---
 
 Citing Evolution ONE
