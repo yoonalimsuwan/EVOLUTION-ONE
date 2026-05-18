@@ -1,3 +1,4 @@
+``
 # Evolution ONE
 
 **Multi‑Level Cancer Evolution & Structural Impact Engine**
@@ -15,9 +16,9 @@ and outputs a comprehensive oncological profile that includes:
 - which targeted drugs or stabilisers can be deployed, and
 - how lifestyle factors correlate with mutation load and duon disruption.
 
-The engine can work entirely on its own, or optionally leverage **REAL FOLD ONE**
-and **REAL FOLD ONE HT** for full‑atom structural impact calculations and
-high‑throughput mutation scanning.
+The engine works out‑of‑the‑box with **real patient data**, and can optionally
+leverage **REAL FOLD ONE** and **REAL FOLD ONE HT** for atomic‑level ΔΔG
+calculations and high‑throughput mutation scanning.
 
 ---
 
@@ -99,3 +100,126 @@ pip install biotite
 
 # Optional: install REAL FOLD ONE and REAL FOLD ONE HT for advanced features
 pip install -e .   # if they are in the same repository
+```
+
+---
+
+Quick Start
+
+```bash
+# Basic analysis from a TCGA MAF file, genes of interest, and duon positions
+python evolution_one.py \
+    --input tcga_lung.maf \
+    --genes EGFR KRAS TP53 \
+    --duon_file duon_positions.txt \
+    --lifestyle_file patient_lifestyle.csv \
+    --plot
+
+# Use VCF input and skip future mutation scanning
+python evolution_one.py \
+    --input patient.vcf --format vcf \
+    --genes BRAF PIK3CA \
+    --no_future
+
+# Include gene interactions (for BV check) and structural analysis
+python evolution_one.py \
+    --input tcga_colon.maf \
+    --genes APC CTNNB1 SMAD4 \
+    --gene_interactions 0 1 0 2 \
+    --pdb_dir ./my_structures \
+    --output_dir ./colon_results
+```
+
+---
+
+Input File Formats
+
+Mutation file (MAF or VCF):
+
+· Standard TCGA MAF or simple VCF with at least Hugo_Symbol and Tumor_Sample_Barcode (MAF) or GENE= in the INFO field (VCF).
+
+Duon file (optional):
+
+· A plain text file with one codon position (1‑based) per line.
+
+Lifestyle file (optional):
+
+· A CSV with columns: sample_id, and any number of environmental factors (e.g., smoking_pack_years, alcohol_consumption, diet_score).
+
+Gene interactions (optional):
+
+· Passed as --gene_interactions i j k l ... where each pair (i, j) represents a known regulatory interaction between gene i and gene j (indices refer to the order in --genes).
+
+PDB directory (optional):
+
+· A folder containing .pdb files for each gene. The engine automatically picks the first file whose name contains the gene symbol.
+
+---
+
+Output Files
+
+File Content
+summary.json Cancer risk, entropy, drug recommendations, BV check
+sample_states.csv Per‑sample mutation load (μ), state (0/1/2)
+phase_diagram.png (if --plot) Entropy vs. mutation load
+
+The summary.json also includes correlations between lifestyle factors and
+mutation load/duon rate if a lifestyle file was provided.
+
+---
+
+Integration with REAL FOLD ONE
+
+Evolution ONE is fully functional on its own, but when REAL FOLD ONE and
+REAL FOLD ONE HT are installed, it gains:
+
+· Accurate ΔΔG calculation – uses the full SOC‑controlled refinement engine
+  instead of the embedded simplified energy function.
+· Complete single‑mutation scanning – leverages the high‑throughput scanner
+  to explore all possible amino‑acid changes, providing a comprehensive list of
+  destabilising mutations.
+
+To enable these features, simply ensure real_fold_one and real_fold_one_ht
+are importable. The scripts will automatically detect them.
+
+---
+
+Architectural Philosophy
+
+Evolution ONE shares the same vendor‑neutral, differentiable‑physics DNA as
+REAL FOLD ONE:
+
+· No CUDA C++ – pure PyTorch operations, enabling seamless execution on
+  NVIDIA GPUs, Apple MPS, Huawei Ascend NPU, or CPU.
+· Differentiable from end to end – the SOC kernel, energy function, and
+  Ito integrators are all differentiable, allowing future integration with
+  deep learning surrogates.
+· Physics first – rather than relying on statistical black‑boxes, Evolution
+  ONE builds on first‑principle models (SOC, SSC, RG, BV) to interpret cancer
+  as a dynamical system.
+
+---
+
+Citing Evolution ONE
+
+If you use this software, please cite:
+
+```
+Yoon A Limsuwan. "Evolution ONE: Multi‑Level Cancer Evolution & Structural Impact Engine."
+Zenodo, 2026. DOI: 10.5281/zenodo.XXXXXXX
+```
+
+---
+
+License
+
+This project is licensed under the MIT License – see LICENSE for details.
+
+---
+
+Contact
+
+Yoon A Limsuwan – GitHub
+Project link: https://github.com/your-username/real-fold-one
+
+```
