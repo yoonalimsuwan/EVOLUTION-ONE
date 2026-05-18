@@ -192,7 +192,7 @@ If you use this software, please cite:
 
 ```
 Yoon A Limsuwan. "Evolution ONE: Multi‑Level Cancer Evolution & Structural Impact Engine."
-Zenodo, 2026. DOI: 10.5281/zenodo.XXXXXXX
+Zenodo, 2026.  DOI: 10.5281/zenodo.20277033
 ```
 
 ---
