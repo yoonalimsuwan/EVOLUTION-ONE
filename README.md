@@ -10,6 +10,7 @@
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.19814975-blue)](https://doi.org/10.5281/zenodo.19814975)
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20194882-blue)](https://doi.org/10.5281/zenodo.20194882)
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20264580-blue)](https://doi.org/10.5281/zenodo.20264580)
+[![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20283534-blue)](https://doi.org/10.5281/zenodo.20283534)
 
 
 Evolution ONE is a standalone, vendor‑neutral platform that models cancer
@@ -448,7 +449,7 @@ If you use this software, please cite:
 
 ```
 Yoon A Limsuwan. "Evolution ONE: Multi‑Level Cancer Evolution & Structural Impact Engine."
-Zenodo, 2026. DOI: 10.5281/zenodo.XXXXXXX
+Zenodo, 2026.  DOI: 10.5281/zenodo.20283534
 ```
 
 ---
