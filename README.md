@@ -6,6 +6,12 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 
+[![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20007526-blue)](https://doi.org/10.5281/zenodo.20007526)
+[![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.19814975-blue)](https://doi.org/10.5281/zenodo.19814975)
+[![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20194882-blue)](https://doi.org/10.5281/zenodo.20194882)
+[![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20264580-blue)](https://doi.org/10.5281/zenodo.20264580)
+
+
 Evolution ONE is a standalone, vendor‑neutral platform that models cancer
 progression through the lens of **Self‑Organised Criticality (SOC)**,
 **duon biology**, and **physics‑based structural refinement**. It ingests
