@@ -267,6 +267,43 @@ REAL FOLD ONE:
   Evolution ONE builds on first‑principle models (SOC, SSC, RG, BV) to
   interpret cancer as a dynamical system.
 
+### Evolution ONE as a Data Source for AI
+
+Just like REAL FOLD ONE, Evolution ONE is designed to be **fully differentiable**
+and **AI‑ready**. Every component—the CSOC kernel, Semantic‑State Contraction,
+Renormalisation Group, and Itô calculus—runs inside PyTorch’s autograd engine,
+meaning it can backpropagate gradients directly to any neural network.
+
+Beyond differentiability, Evolution ONE produces **rich, structured outputs**
+that serve as high‑quality training data for a wide range of AI models:
+
+- **Numerical vectors & labels** – mutation load (μ), duon disruption rate
+  (μ_duon), evolutionary state (0/1/2), entropy (H), future predicted μ
+  (from SOC and Itô simulations), and ΔΔG values (via REAL FOLD ONE).
+- **Drug & therapy recommendations** – targeted drugs, protein stabilisers,
+  CRISPR gRNA sequences, and epigenetic editing targets, all readily usable
+  in decision‑support models.
+- **Lifestyle correlations** – quantitative links between environmental
+  factors and mutation load, enabling epidemiological AI studies.
+
+AI systems that can be trained on Evolution ONE outputs include:
+
+- **Graph Neural Networks** – for gene regulatory network analysis and
+  duon‑interaction prediction.
+- **Reinforcement Learning** – to design optimal CRISPR strategies that
+  minimise off‑target effects.
+- **Bayesian Optimization** – for personalised therapy selection and dosage
+  scheduling.
+- **Transformer models** – for survival prediction and patient stratification
+  from the evolutionary state profiles.
+- **Diffusion models** – for generating synthetic cancer evolution trajectories
+  that respect SOC dynamics.
+
+When coupled with **REAL FOLD ONE**, Evolution ONE also helps create **physics‑
+based training sets** for AI surrogate models that can predict ΔΔG or protein
+stability orders of magnitude faster than full simulation—a cornerstone of
+the O(1) refinement pipeline described in the REAL FOLD ONE documentation.
+
 ---
 
 Citing Evolution ONE
