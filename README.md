@@ -24,24 +24,6 @@ calculation and high‑throughput mutation scanning.
 
 ---
 
-## Table of Contents
-- [Features](#features)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [Input File Formats](#input-file-formats)
-- [Output Files](#output-files)
-- [Integration with REAL FOLD ONE](#integration-with-real-fold-one)
-- [How Evolution ONE Works](#how-evolution-one-works)
-- [Pilot Study: Lung Adenocarcinoma (TCGA‑LUAD)](#pilot-study-lung-adenocarcinoma-tcga-luad)
-- [CRISPR & Epigenetic Editing Support](#crispr--epigenetic-editing-support)
-- [Hyperparameter Tuning & Checkpointing](#hyperparameter-tuning--checkpointing)
-- [Architectural Philosophy](#architectural-philosophy)
-- [Citing Evolution ONE](#citing-evolution-one)
-- [License](#license)
-- [Contact](#contact)
-
----
-
 ## Features
 
 - **SOC‑Based Regime Classification** – Classifies each tumour sample as
@@ -83,8 +65,8 @@ calculation and high‑throughput mutation scanning.
 ## Installation
 
 ```bash
-git clone https://github.com/your-username/real-fold-one.git
-cd real-fold-one
+git clone https://github.com/yoonalimsuwan/EVOLUTION-ONE.git
+cd evolution-one
 
 # Create and activate a conda environment (optional)
 conda create -n evolution python=3.10 -y
