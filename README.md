@@ -267,6 +267,39 @@ REAL FOLD ONE:
   Evolution ONE builds on first‑principle models (SOC, SSC, RG, BV) to
   interpret cancer as a dynamical system.
 
+### How Evolution ONE Works – The Three Evolutionary Regimes
+
+Evolution ONE models cancer progression as a **dynamical phase transition**
+driven by the accumulation of mutations. Rather than treating every tumour
+as a collection of independent random events, the engine quantifies the
+**mutation load μ** (fraction of key genes affected) and uses principles
+from **Self‑Organised Criticality (SOC)** to place each sample into one
+of three regimes:
+
+| Regime | State | μ range | Biological interpretation |
+|--------|-------|---------|---------------------------|
+| **Stable (Stochastic)** | 0 | μ < 0.2 | Mutations are sparse and effectively neutral. The system is far from a critical point and behaves as a random drift process. |
+| **Critical (Selection)** | 1 | 0.2 ≤ μ ≤ 0.8 | The tumour is at the edge of collapse. Multi‑level selection (coding + regulatory, via duons) becomes active. Small perturbations can trigger SOC‑like avalanches, generating heterogeneity. |
+| **Collapse (Deterministic)** | 2 | μ > 0.8 | The mutational load overwhelms the system. Key proteins destabilise, regulatory networks break down, and the cancer follows a deterministic trajectory toward aggressive growth or cell death. |
+
+These regimes are not merely descriptive—they are **quantified** by the
+engine:
+
+- **Entropy H** of the state distribution measures the degree of
+  heterogeneity.
+- **SOC evolution** (feedback between stress σ and temperature T) and
+  **Itô Langevin dynamics** simulate future μ, predicting whether a stable
+  or critical tumour will cross into the collapse regime.
+- **Duon disruption** (μ_duon) adds a second dimension, revealing
+  mutations that simultaneously alter protein sequence and gene
+  regulation—a hallmark of multi‑level selection.
+
+By grounding cancer evolution in SOC physics, Evolution ONE moves beyond
+the classic driver/passenger dichotomy and provides a **unified mathematical
+language** for tumour dynamics. This is the same language that describes
+earthquakes, avalanches, and financial crashes—phenomena where a critical
+state separates order from chaos.
+
 ### Evolution ONE as a Data Source for AI
 
 Just like REAL FOLD ONE, Evolution ONE is designed to be **fully differentiable**
@@ -303,6 +336,103 @@ When coupled with **REAL FOLD ONE**, Evolution ONE also helps create **physics�
 based training sets** for AI surrogate models that can predict ΔΔG or protein
 stability orders of magnitude faster than full simulation—a cornerstone of
 the O(1) refinement pipeline described in the REAL FOLD ONE documentation.
+
+```markdown
+### Pilot Study: Lung Adenocarcinoma (TCGA‑LUAD)
+
+To demonstrate Evolution ONE’s capabilities on real‑world data, we provide
+a ready‑to‑run pilot study for **Lung Adenocarcinoma (LUAD)** using the
+public TCGA dataset.
+
+**Why LUAD?**
+- Large sample size (>500 patients) with well‑curated mutation calls.
+- Clinically actionable genes (`EGFR`, `KRAS`, `ALK`, `BRAF`, `MET`) with
+  known targeted therapies.
+- High prevalence of duon‑containing genes and documented resistance mutations
+  that can be predicted *in silico*.
+
+#### 1. Obtain the data
+
+```bash
+# Download the TCGA MC3 MAF file (public, no login required)
+wget https://api.gdc.cancer.gov/data/1c8cfe5f-e52d-41ba-94da-f15ea1337efc \
+    -O mc3.v0.2.8.PUBLIC.maf.gz
+gunzip mc3.v0.2.8.PUBLIC.maf.gz
+
+# Filter for LUAD samples and genes of interest
+python -c "
+import pandas as pd
+maf = pd.read_csv('mc3.v0.2.8.PUBLIC.maf', sep='\t', comment='#', low_memory=False)
+luad = maf[maf['Project_Code'] == 'LUAD']
+luad.to_csv('luad.maf', sep='\t', index=False)
+"
+```
+
+2. Prepare supporting files
+
+· Duon positions – create a text file luad_duons.txt with one codon
+  position per line for the genes of interest (sources: Ensembl regulatory
+  build, literature). Example:
+  ```
+  12
+  25
+  58
+  ...
+  ```
+· Lifestyle data – (optional) a CSV luad_clinical.csv with columns:
+  sample_id, smoking_pack_years, gender, age_at_diagnosis.
+  This can be extracted from the TCGA clinical supplement.
+· PDB structures – download the structures for your target genes into
+  ./pdbs/ (e.g., EGFR.pdb, KRAS.pdb). AlphaFold‑predicted models or
+  experimental PDBs are both suitable.
+
+3. Run Evolution ONE
+
+```bash
+python evolution_one.py \
+    --input luad.maf \
+    --genes EGFR KRAS ALK BRAF MET \
+    --duon_file luad_duons.txt \
+    --lifestyle_file luad_clinical.csv \
+    --pdb_dir ./pdbs \
+    --output_dir ./luad_results \
+    --plot
+```
+
+4. Interpret the results
+
+· sample_states.csv – each TCGA sample is assigned a regime (0 = stable,
+  1 = critical, 2 = collapse). Compare these states with overall survival
+  (e.g., Kaplan‑Meier curves) to see whether the critical/collapse groups
+  have poorer prognosis.
+· summary.json – contains the predicted cancer risk, future μ values
+  (SOC and Itô), and drug recommendations.
+· phase_diagram.png – visualises the entropy landscape. LUAD samples
+  often span the entire range from stable to collapse, demonstrating the
+  SOC‑like behaviour of the disease.
+· Drug recommendations – the engine lists existing targeted therapies
+  for destabilised genes. Cross‑reference these suggestions with NCCN
+  guidelines to evaluate clinical relevance.
+
+5. Expected findings
+
+In preliminary tests with TCGA‑LUAD, Evolution ONE typically reveals:
+
+· Distinct entropy profiles – patients with high entropy (critical state)
+  tend to have worse survival, consistent with multi‑level selection theory.
+· Predicted escape mutations – for EGFR‑mutated samples, the engine
+  often highlights T790M and C797S as top destabilising mutations, matching
+  clinical observations of acquired resistance.
+· Lifestyle correlations – smoking pack‑years frequently show a
+  significant positive correlation with duon disruption rate, suggesting
+  a mechanistic link between environmental exposure and regulatory‑network
+  damage.
+
+This pilot serves as a template for any cancer type with sufficient mutation
+and clinical data. Researchers are encouraged to adapt the pipeline to their
+cohorts and to contribute additional duon annotations or drug target maps.
+
+```
 
 ---
 
