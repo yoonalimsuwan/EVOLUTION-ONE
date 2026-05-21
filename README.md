@@ -9,8 +9,7 @@
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20007526-blue)](https://doi.org/10.5281/zenodo.20007526)
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.19814975-blue)](https://doi.org/10.5281/zenodo.19814975)
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20194882-blue)](https://doi.org/10.5281/zenodo.20194882)
-[![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20283534-blue)](https://doi.org/10.5281/zenodo.20283534)
-
+[![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20324687-blue)](https://doi.org/10.5281/zenodo.20324687)
 
 Evolution ONE is a standalone, vendor‑neutral platform that models cancer
 progression through the lens of **Self‑Organised Criticality (SOC)**,
@@ -267,7 +266,7 @@ If you use this software, please cite:
 
 ```
 Yoon A Limsuwan. "Evolution ONE: Multi‑Level Cancer Evolution & Structural Impact Engine."
-Zenodo, 2026.  DOI: 10.5281/zenodo.20283534
+Zenodo, 2026.   DOI: 10.5281/zenodo.20324687
 ```
 
 ---
