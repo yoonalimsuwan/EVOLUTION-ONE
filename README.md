@@ -9,7 +9,7 @@
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20007526-blue)](https://doi.org/10.5281/zenodo.20007526)
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.19814975-blue)](https://doi.org/10.5281/zenodo.19814975)
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20194882-blue)](https://doi.org/10.5281/zenodo.20194882)
-[![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20428534-blue)](https://doi.org/10.5281/zenodo.20428534)
+[![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20429183-blue)](https://doi.org/10.5281/zenodo.20429183)
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20427742-blue)](https://doi.org/10.5281/zenodo.20427742)
 
  
@@ -341,7 +341,7 @@ If you use this software, please cite:
 
 ```
 Yoon A Limsuwan. "Evolution ONE: Multi‑Level Cancer Evolution & Structural Impact Engine."
-Zenodo, 2026.    DOI: 10.5281/zenodo.20428534
+Zenodo, 2026.    https://doi.org/10.5281/zenodo.20429183
 ```
 
 ---
