@@ -11,6 +11,7 @@
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20194882-blue)](https://doi.org/10.5281/zenodo.20194882)
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20429183-blue)](https://doi.org/10.5281/zenodo.20429183)
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20451155-blue)](https://doi.org/10.5281/zenodo.20451155)
+[![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20453128-blue)](https://doi.org/10.5281/zenodo.20453128)
 
  
 Evolution ONE is a standalone, vendor‑neutral platform that models cancer
