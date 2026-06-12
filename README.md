@@ -315,12 +315,13 @@ EVOLUTION ONE is built upon an original interdisciplinary framework utilizing pr
 
 
 ---
+```
 
 Citing Evolution ONE
 
 If you use this software, please cite:
 
-```
+`
 Yoon A Limsuwan. "Evolution ONE: Multi‑Level Cancer Evolution & Structural Impact Engine And Epidemiology."
 Zenodo, 2026.
 https://doi.org/10.5281/zenodo.20608513
