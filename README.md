@@ -116,7 +116,7 @@ Quick Start
 
 ```bash
 # Basic analysis from a TCGA MAF file with duon BED and reference genome
-python evolution_one.py \
+python evolution_one_v3.py \
     --input tcga_lung.maf \
     --genes EGFR KRAS TP53 \
     --duon_bed duons.bed \
@@ -125,13 +125,13 @@ python evolution_one.py \
     --plot
 
 # Use VCF input and skip future mutation scanning
-python evolution_one.py \
+python evolution_one_v3.py \
     --input patient.vcf --format vcf \
     --genes BRAF PIK3CA \
     --no_future
 
 # Train SOC thresholds from clinical labels (Optuna) and generate CRISPR designs
-python evolution_one.py \
+python evolution_one_v3.py \
     --input tcga_colon.maf \
     --genes APC CTNNB1 SMAD4 \
     --clinical_labels_file labels.csv \
@@ -141,7 +141,7 @@ python evolution_one.py \
     --output_dir ./colon_results
 
 # Resume a previous run from checkpoint
-python evolution_one.py \
+python evolution_one_v3.py \
     --input tcga_luad.maf \
     --genes EGFR KRAS \
     --resume ./evo_output/checkpoint.pkl
@@ -307,30 +307,7 @@ EVOLUTION_ONE (Epidemiology Architecture)
  * PyTorch 2.0+ (with CUDA support)
  * Biopython
  * NumPy / SciPy / Pandas
-### Basic Usage: Simulating Pathogen Phase Transitions
-```python
-import torch
-from evolution_one.epidemiology import PandemicPhaseEngine, ViralEvolutionPredictor
 
-# Initialize the Epidemiological Phase Engine
-epi_engine = PandemicPhaseEngine(
-    population_size=1678000, 
-    initial_infected=12, 
-    mode="deterministic"
-)
-
-# Load viral genome structural configuration (e.g., Spike Protein Variant)
-evolution_predictor = ViralEvolutionPredictor(pathogen_id="PATHOGEN_X_2026")
-delta_delta_g = evolution_predictor.compute_receptor_affinity(mutation_vector="S:E484K")
-
-print(f"Predicted Structural Binding Affinity Shift (ΔΔG): {delta_delta_g} kcal/mol")
-
-# Run simulation through Itô-Langevin Integrator across 180 days
-simulation_results = epi_engine.evolve_system(days=180, noise_coefficient=0.05)
-
-# Check for Self-Organized Criticality (SOC) tipping point
-if simulation_results['soc_state'] == "CRITICAL":
-    print(f"Warning: Pandemic threshold breach predicted at Day {simulation_results['tipping_point_day']}")
 
 ```
 ## Academic & Open Science Foundation
