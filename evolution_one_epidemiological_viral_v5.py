@@ -64,6 +64,7 @@ from one_core_evolution import (
     CheckpointManager,           # canonical checkpoint
     LangevinEvolutionBridge,     # Langevin ↔ Rt bridge
     LangevinBridgeMixin,         # Fix 3: attach_langevin_bridge() mixin
+    DifferentiableIto,           # fully differentiable Itô integrator
     EpiEvolutionBridge,          # Bug 7: ↔ EvolutionONEEngine bridge
     CahnHilliardEvoBridge,       # Fix 5: CH3D ↔ epi bridge
     get_device as _core_get_device,
@@ -843,7 +844,7 @@ class EpiForecastEngine(LangevinBridgeMixin):
 
     Bridge usage::
 
-        from structural_langevin_evo_v4 import AdvancedStructuralLangevin
+        from structural_langevin_evo_v5 import AdvancedStructuralLangevin
         integrator = AdvancedStructuralLangevin(dt=0.002, base_temp=310.0)
         bridge = engine.attach_langevin_bridge(integrator)
 
