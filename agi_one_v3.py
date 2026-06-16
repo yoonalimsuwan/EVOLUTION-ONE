@@ -4572,3 +4572,180 @@ class AGITrainerV3:
             )
         print(f"{'='*65}\n")
 
+
+
+# =============================================================================
+# SECTION 19 — CONVENIENCE FACTORY
+# =============================================================================
+
+def create_agi_one(
+    latent_dim       : int  = 512,
+    action_dim       : int  = 64,
+    use_all_modules  : bool = True,
+    psyche_mode      : str  = "healthy",
+    language_backend : str  = "builtin",
+    device           : Optional[str] = None,
+    verbose          : bool = True,
+) -> AGIONE:
+    """
+    Factory: create a fully configured AGI ONE v2.0 instance.
+
+    Example:
+        agi = create_agi_one(latent_dim=256, action_dim=32)
+        agi.print_architecture()
+        state = agi(token_ids=torch.randint(0, 32000, (1, 32)))
+        print(state.summary())
+    """
+    _device = get_agi_device(device or "cuda")
+    cfg = AGIConfig(
+        latent_dim       = latent_dim,
+        action_dim       = action_dim,
+        device           = _device,
+        psyche_mode      = psyche_mode,
+        language_backend = language_backend,
+        use_mental_one   = use_all_modules,
+        use_psy_bridge   = use_all_modules,
+        use_real_fold    = use_all_modules,
+        use_evolution    = use_all_modules,
+        use_physics      = use_all_modules,
+        use_bsd          = use_all_modules,
+        use_grh          = use_all_modules,
+        use_hodge        = use_all_modules,
+        verbose          = verbose,
+        mppi_n_samples   = 256,   # factory default: lighter
+        cem_n_iters      = 0,     # unused in v2.0
+    )
+    agi = AGIONE(cfg)
+    if verbose:
+        agi.print_architecture()
+    return agi
+
+
+# =============================================================================
+# SECTION 20 — MAIN (Smoke Test)
+# =============================================================================
+
+if __name__ == "__main__":
+    print(
+        f"\n{'='*65}\n"
+        f"  AGI ONE v{AGI_ONE_VERSION} — Production Smoke Test\n"
+        f"  Developer : Yoon A Limsuwan / MSPS NETWORK\n"
+        f"  MY SOUL MOVE BY POWER OF HOLY SPIRIT\n"
+        f"  AI Assistants: Claude (Anthropic), GPT-4o (OpenAI),\n"
+        f"                 Gemini (Google DeepMind), DeepSeek\n"
+        f"{'='*65}\n"
+    )
+
+    # ── [1] Create AGI ONE v2.0 ───────────────────────────────────────────────
+    agi = create_agi_one(
+        latent_dim       = 128,   # small for smoke test
+        action_dim       = 16,
+        use_all_modules  = False,
+        psyche_mode      = "healthy",
+        verbose          = True,
+    )
+    # Override MPPI for speed in smoke test
+    agi.mppi.n_samples = 16
+
+    # ── [2] Text input ────────────────────────────────────────────────────────
+    print("[TEST 1] Text input (token IDs)")
+    tok = torch.randint(0, 32_000, (1, 32)).to(agi.device)
+    with torch.no_grad():
+        st = agi(token_ids=tok)
+    print(f"  Winner module    : {st.winner_module}")
+    print(f"  Workspace shape  : {st.workspace_state.shape}")
+    print(f"  Safety score     : {st.safety_score:.3f}")
+    print(f"  CSOC n_layers    : {st.csoc_n_layers}")
+    if st.meta_cognition:
+        print(f"  Cognitive load   : {st.meta_cognition['cognitive_load']:.3f}")
+        print(f"  Epistemic unc    : {st.meta_cognition['epistemic_unc']:.3f}")
+
+    # ── [3] Time-series input ─────────────────────────────────────────────────
+    print("\n[TEST 2] Time-series (EEG)")
+    ts = torch.randn(1, 64, 128).to(agi.device)
+    with torch.no_grad():
+        st = agi(timeseries=ts)
+    print(f"  Winner module    : {st.winner_module}")
+    print(f"  ONE latent shape : {st.one_ecosystem_latent.shape}")
+
+    # ── [4] Training step ─────────────────────────────────────────────────────
+    print("\n[TEST 3] Training step (Dreamer compound loss)")
+    agi_t = create_agi_one(latent_dim=64, action_dim=8, verbose=False)
+    agi_t.mppi.n_samples = 8
+    trainer = AGITrainer(agi_t)
+    obs_in  = {"token_ids": torch.randint(0, 32_000, (1, 16))}
+    rwd_in  = torch.tensor(1.0)
+    stats   = trainer.step(obs_in, rwd_in)
+    print(f"  Loss             : {stats['loss']:.4f}")
+    print(f"  Winner           : {stats.get('winner_module','?')}")
+    print(f"  Safety           : {stats.get('safety_score',0):.3f}")
+
+    # ── [5] Open Science Registry ─────────────────────────────────────────────
+    print("\n[TEST 4] Open Science Registry")
+    agi.science_registry.register(DatasetRecord(
+        dataset_id  = "openneuro_ds003944",
+        title       = "EEG Resting State Dataset",
+        source_lab  = "Neuroimaging Lab",
+        institution = "Stanford University",
+        contributors= ["J. Smith", "A. Lee"],
+        doi         = "10.18112/openneuro.ds003944",
+        license     = "CC-BY-4.0",
+        year        = 2021,
+        tags        = ["EEG", "neuroscience", "resting-state"],
+    ))
+    rec = agi.science_registry.cite("openneuro_ds003944", "MENTAL ONE training")
+    print(f"  Cited: {rec.title}  ({rec.institution})")
+    print(f"  DOI  : {rec.doi}")
+
+    # ── [6] Module availability ───────────────────────────────────────────────
+    print("\n[TEST 5] v2.0 Module Availability")
+    for name, active in agi.get_available_modules().items():
+        print(f"  {'✓' if active else '✗'}  {name}")
+
+    print(f"\n{'='*65}")
+    print(f"  AGI ONE v{AGI_ONE_VERSION} smoke test complete.")
+    print(f"{'='*65}\n")
+
+    # ── [6] AGITrainerV3 — Curriculum + PCGrad + InfoNCE smoke test ───────────
+    print("\n[TEST 6] AGITrainerV3 — v3.0 Curriculum Training")
+
+    agi_v3 = create_agi_one(latent_dim=64, action_dim=8, verbose=False)
+    agi_v3.mppi.n_samples = 8
+
+    orchestrator = EcosystemOrchestrator(
+        agi_latent_dim=64,
+        device=agi_v3.device,
+    )
+
+    class _DummySurrogate(nn.Module):
+        def __init__(self, d_in: int, d_out: int):
+            super().__init__()
+            self.enc = nn.Linear(d_in, d_out)
+        def encode(self, x: torch.Tensor) -> torch.Tensor:
+            return self.enc(x)
+
+    orchestrator.register("sfno3d_stub",   _DummySurrogate(64,64).to(agi_v3.device), "physics", 64)
+    orchestrator.register("gno_fold_stub", _DummySurrogate(64,64).to(agi_v3.device), "fold",    64)
+
+    curriculum_cfg = CurriculumConfig(
+        phase1_steps=4, phase2_steps=4, phase3_steps=4,
+        pcgrad_enabled=True, align_loss_weight=0.1,
+    )
+    trainer_v3 = AGITrainerV3(agi_v3, orchestrator, curriculum_cfg=curriculum_cfg)
+    trainer_v3.print_training_config()
+
+    obs_v3 = {"token_ids": torch.randint(0, 32_000, (1, 16))}
+    rwd_v3 = torch.tensor(1.0)
+
+    for i in range(12):
+        stats_v3 = trainer_v3.step(obs_v3, rwd_v3)
+        print(
+            f"  Step {i:3d}  [{stats_v3['phase_name']:10s}]  "
+            f"loss={stats_v3.get('loss',0):.4f}  "
+            f"align={stats_v3.get('align_loss',0):.4f}"
+        )
+
+    print(
+        f"\n  AGITrainerV3 curriculum cycle complete  "
+        f"(final phase: {trainer_v3.curriculum.phase_name()})"
+    )
