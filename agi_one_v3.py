@@ -3143,3 +3143,418 @@ class AGIONE(nn.Module):
             return total
         return zero
 
+
+
+    # =========================================================================
+    # UTILITY
+    # =========================================================================
+
+    def reset(self) -> None:
+        self.wm_h.zero_()
+        self.wm_z.zero_()
+        self.working_memory.reset()
+        self.mppi.reset()
+        self._step = 0
+
+    def get_available_modules(self) -> Dict[str, bool]:
+        return {
+            "perception_vit"         : True,
+            "audio_conformer"        : True,
+            "language_rope_gpt"      : hasattr(self, "language"),
+            "working_memory_ssc"     : True,
+            "episodic_memory_dnd"    : True,
+            "global_workspace_gwt"   : True,
+            "dreamerv3_world_model"  : True,
+            "mppi_planner"           : True,
+            "meta_cognition_csoc"    : True,
+            "psyche_executive_layer" : True,
+            "ssc_stabilizer"         : True,
+            "interface_attention"    : True,
+            "csoc_compute_ctrl"      : True,
+            "struct_langevin_diff"   : True,
+            "loss_balancer_kendall"  : True,
+            "ppo_full"               : True,
+            "math_bsd_one"           : HAS_BSD,
+            "math_grh_one"           : HAS_GRH,
+            "math_hodge_one"         : HAS_HODGE,
+            "mental_one"             : self.mental_one is not None,
+            "real_fold_one"          : self.real_fold is not None,
+            "evolution_one"          : self.evolution_one is not None,
+            "epidemic_engine"        : self.epidemic_engine is not None,
+            "dns_cfd"                : self.dns_engine is not None,
+            "standard_one"           : self.standard_one is not None,
+            "yang_mills"             : self.yang_mills is not None,
+            "rh_explorer"            : self.rh_engine is not None,
+            "open_science_registry"  : True,
+        }
+
+    def print_architecture(self) -> None:
+        mods = self.get_available_modules()
+        print(f"\n{'='*65}")
+        print(f"  AGI ONE v{AGI_ONE_VERSION} — Production Architecture")
+        print(f"  Developer  : Yoon A Limsuwan / MSPS NETWORK")
+        print(f"  MY SOUL MOVE BY POWER OF HOLY SPIRIT")
+        print(f"  AI Assistants: Claude (Anthropic), GPT-4o (OpenAI),")
+        print(f"                 Gemini (Google DeepMind), DeepSeek")
+        print(f"{'='*65}")
+        print(f"  Device        : {self.device}")
+        print(f"  Latent dim    : {self.cfg.latent_dim}")
+        print(f"  Action dim    : {self.cfg.action_dim}")
+        print(f"  Memory slots  : {self.cfg.memory_slots}")
+        print(f"  Planning H    : {self.cfg.planning_horizon}")
+        print(f"  MPPI samples  : {self.cfg.mppi_n_samples}")
+        print(f"  Dreamer cats  : {self.cfg.dreamer_stoch_size}×{self.cfg.dreamer_stoch_classes}")
+        total = sum(p.numel() for p in self.parameters())
+        print(f"  Parameters    : {total:,}")
+        print(f"\n  Module Status (v2.0):")
+        for name, active in mods.items():
+            s = "✓" if active else "✗"
+            print(f"    {s}  {name}")
+        print(f"{'='*65}\n")
+
+
+# =============================================================================
+# SECTION 18-A — ECOSYSTEM ORCHESTRATOR  (v3.0 NEW)
+# Distributed surrogate module hub — replaces direct engine embedding
+# =============================================================================
+
+class SurrogateAdapter:
+    """
+    Thin adapter wrapping an uploaded surrogate module (e.g. StructuralFNO3D,
+    StructuralGNOFold, StructuralGNOEvolution …) into a uniform interface
+    used by EcosystemOrchestrator.
+
+    The adapter holds:
+      • module      : nn.Module  — the actual surrogate network
+      • domain      : str        — 'physics' | 'fold' | 'evolution' |
+                                   'mental' | 'math' | 'hodge' | 'numbertheory'
+      • frozen_backbone : bool   — whether backbone params are frozen
+      • latent_dim  : int        — output latent dimension (auto-detected)
+    """
+
+    def __init__(
+        self,
+        module      : nn.Module,
+        domain      : str,
+        latent_dim  : int,
+        name        : str = "",
+    ) -> None:
+        self.module       = module
+        self.domain       = domain
+        self.latent_dim   = latent_dim
+        self.name         = name or domain
+        self.frozen_backbone = False
+        self._projection: Optional[nn.Linear] = None   # align to AGI latent
+
+    def set_projection(self, agi_latent_dim: int, device: torch.device) -> None:
+        """Create a learnable linear head to project surrogate output → AGI latent."""
+        if self.latent_dim != agi_latent_dim:
+            self._projection = nn.Linear(self.latent_dim, agi_latent_dim).to(device)
+        else:
+            self._projection = None
+
+    def freeze_backbone(self, freeze: bool = True) -> None:
+        """Freeze/unfreeze backbone parameters (keep output head trainable)."""
+        self.frozen_backbone = freeze
+        for name, p in self.module.named_parameters():
+            # Heuristic: layers named 'head', 'out', 'proj' are output heads
+            is_head = any(k in name for k in ("head", "out_proj", "output", "decoder"))
+            p.requires_grad = (not freeze) or is_head
+
+    def get_trainable_params(self) -> List[nn.Parameter]:
+        params = [p for p in self.module.parameters() if p.requires_grad]
+        if self._projection is not None:
+            params += list(self._projection.parameters())
+        return params
+
+    def encode(self, dummy_latent: torch.Tensor) -> torch.Tensor:
+        """
+        Produce a latent vector from the surrogate using a dummy forward pass.
+
+        In a real deployment each surrogate has its own input batch.
+        Here we use the AGI perception latent as a conditioning signal
+        (projected to match the surrogate's expected input dim via its own
+        internal encoder or a learned adaptor layer).
+
+        Returns: (1, agi_latent_dim) tensor on the same device.
+        """
+        device = dummy_latent.device
+        # Each surrogate exposes .encode() or falls back to a zero latent
+        try:
+            with torch.set_grad_enabled(dummy_latent.requires_grad):
+                # Minimal stub: surrogates that expose encode() use it;
+                # others return a zeros placeholder until properly wired.
+                if hasattr(self.module, "encode"):
+                    out = self.module.encode(dummy_latent)           # (B, D_surr)
+                else:
+                    out = torch.zeros(
+                        dummy_latent.shape[0], self.latent_dim,
+                        device=device, dtype=dummy_latent.dtype
+                    )
+        except Exception as exc:
+            logger.debug(f"SurrogateAdapter({self.name}).encode() fallback: {exc}")
+            out = torch.zeros(
+                dummy_latent.shape[0], self.latent_dim,
+                device=device, dtype=dummy_latent.dtype
+            )
+
+        if self._projection is not None:
+            out = self._projection(out)
+        return out                                                   # (B, D_agi)
+
+
+class EcosystemOrchestrator(nn.Module):
+    """
+    AGI ONE v3 Distributed Ecosystem Hub.
+
+    Manages a registry of SurrogateAdapters (one per uploaded module) and
+    provides:
+      1. Selective freezing per curriculum phase
+      2. Per-domain latent extraction (for GlobalWorkspace / InfoNCE)
+      3. Unified parameter groups for Decoupled Optimizers
+      4. Health monitoring (NaN guard per domain)
+
+    Domain groups (match AGITrainerV3 optimizer keys):
+      'physics'      → structural_fno_3d, ngo_physics_one
+      'fold'         → structural_gno_fold_v3
+      'evolution'    → structural_gno_evolution
+      'mental'       → mental_structural_operator_v3
+      'math'         → structural_gno_numbertheory
+      'hodge'        → structural_gno_hodge
+    """
+
+    DOMAIN_ORDER: List[str] = [
+        "physics", "fold", "evolution", "mental", "math", "hodge",
+    ]
+
+    def __init__(self, agi_latent_dim: int, device: torch.device) -> None:
+        super().__init__()
+        self.agi_latent_dim = agi_latent_dim
+        self.device         = device
+        self._adapters: Dict[str, SurrogateAdapter] = {}
+        # Learnable projection heads are registered as a ModuleDict
+        self._proj_heads = nn.ModuleDict()
+
+    # ── Registration ─────────────────────────────────────────────────────────
+
+    def register(
+        self,
+        name      : str,
+        module    : nn.Module,
+        domain    : str,
+        latent_dim: int,
+    ) -> None:
+        """Register a surrogate module under a given domain."""
+        adapter = SurrogateAdapter(module, domain, latent_dim, name)
+        adapter.set_projection(self.agi_latent_dim, self.device)
+        self._adapters[name] = adapter
+
+        if adapter._projection is not None:
+            self._proj_heads[name] = adapter._projection
+
+        logger.info(
+            f"EcosystemOrchestrator: registered '{name}'  "
+            f"domain={domain}  latent={latent_dim}→{self.agi_latent_dim}"
+        )
+
+    # ── Curriculum-phase freeze control ──────────────────────────────────────
+
+    def apply_curriculum_phase(self, phase: int) -> None:
+        """
+        Control which surrogate parameters are frozen per curriculum phase.
+
+        Phase 1 — FOUNDATION  : all surrogates trainable (they train independently)
+        Phase 2 — ALIGNMENT   : freeze surrogate backbones; only proj heads train
+        Phase 3 — COGNITIVE   : unfreeze surrogate output heads; backbone stays frozen
+        """
+        if phase == 1:
+            for adp in self._adapters.values():
+                adp.freeze_backbone(False)
+            logger.info("EcosystemOrchestrator → Phase 1: all surrogates UNFROZEN")
+
+        elif phase == 2:
+            for adp in self._adapters.values():
+                adp.freeze_backbone(True)      # backbone frozen, heads still live
+            logger.info("EcosystemOrchestrator → Phase 2: surrogate backbones FROZEN")
+
+        elif phase == 3:
+            for adp in self._adapters.values():
+                adp.freeze_backbone(True)      # backbones stay frozen
+            # Projection heads remain trainable (they are in self._proj_heads)
+            logger.info(
+                "EcosystemOrchestrator → Phase 3: backbones FROZEN, heads TRAINABLE"
+            )
+
+    # ── Domain-grouped parameter lists ───────────────────────────────────────
+
+    def param_groups_by_domain(self) -> Dict[str, List[nn.Parameter]]:
+        """Return {domain: [trainable params]} for Decoupled Optimizers."""
+        groups: Dict[str, List[nn.Parameter]] = {d: [] for d in self.DOMAIN_ORDER}
+        for name, adp in self._adapters.items():
+            domain = adp.domain if adp.domain in groups else "physics"
+            groups[domain].extend(adp.get_trainable_params())
+        return {k: v for k, v in groups.items() if v}
+
+    # ── Forward: extract per-domain latents ──────────────────────────────────
+
+    def forward(
+        self,
+        perception_latent: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Query all registered surrogates with the AGI perception latent.
+
+        Returns dict {name: latent_tensor (B, D_agi)} for each surrogate,
+        plus an aggregated 'ecosystem' key (mean-pooled across all domains).
+        """
+        outputs: Dict[str, torch.Tensor] = {}
+        domain_latents: Dict[str, List[torch.Tensor]] = {
+            d: [] for d in self.DOMAIN_ORDER
+        }
+
+        for name, adp in self._adapters.items():
+            latent = adp.encode(perception_latent)
+
+            # NaN guard
+            if torch.isnan(latent).any():
+                logger.warning(
+                    f"EcosystemOrchestrator: NaN in surrogate '{name}' — zeroed"
+                )
+                latent = torch.zeros_like(latent)
+
+            outputs[name] = latent
+            dom = adp.domain if adp.domain in domain_latents else "physics"
+            domain_latents[dom].append(latent)
+
+        # Per-domain mean (for InfoNCE and GlobalWorkspace)
+        for dom, tensors in domain_latents.items():
+            if tensors:
+                outputs[f"domain_{dom}"] = torch.stack(tensors, dim=0).mean(0)
+
+        # Global ecosystem latent (mean across all registered surrogates)
+        if outputs:
+            all_latents = [v for k, v in outputs.items() if not k.startswith("domain_")]
+            if all_latents:
+                outputs["ecosystem"] = torch.stack(all_latents, dim=0).mean(0)
+
+        return outputs
+
+    def registered_names(self) -> List[str]:
+        return list(self._adapters.keys())
+
+    def __repr__(self) -> str:
+        lines = [f"EcosystemOrchestrator(agi_latent={self.agi_latent_dim})"]
+        for name, adp in self._adapters.items():
+            frozen = "frozen-bb" if adp.frozen_backbone else "trainable"
+            lines.append(f"  [{adp.domain:12s}]  {name}  ({frozen})")
+        return "\n".join(lines)
+
+
+# =============================================================================
+# SECTION 18-B — PCGrad GRADIENT SURGERY  (v3.0 NEW)
+# Yu et al. 2020 "Gradient Surgery for Multi-Task Learning"
+# =============================================================================
+
+class PCGradOptimizer:
+    """
+    PCGrad (Projecting Conflicting Gradients) wrapper.
+
+    Wraps an existing torch.optim.Optimizer.  On each step:
+      1. Compute per-task gradients individually (no accumulation)
+      2. For each task pair (i, j): if g_i · g_j < 0, project g_i onto the
+         normal plane of g_j  →  g_i' = g_i - (g_i·g_j / ‖g_j‖²) g_j
+      3. Sum projected gradients and load into .grad buffers
+      4. Call wrapped optimizer.step()
+
+    Usage:
+        pcgrad = PCGradOptimizer(torch.optim.AdamW(params, lr=1e-4))
+        losses = [loss_physics, loss_language, loss_rl]
+        pcgrad.step(losses, retain_graph=False)
+
+    Note: losses must each be separately computable (no joint backward).
+          If you have already summed them, PCGrad has no effect.
+    """
+
+    def __init__(self, optimizer: torch.optim.Optimizer) -> None:
+        self._opt    = optimizer
+        self._params = [
+            p for group in optimizer.param_groups
+            for p in group["params"] if p.requires_grad
+        ]
+
+    def zero_grad(self) -> None:
+        self._opt.zero_grad()
+
+    def _flatten_grad(self) -> torch.Tensor:
+        grads = []
+        for p in self._params:
+            if p.grad is not None:
+                grads.append(p.grad.detach().flatten())
+            else:
+                grads.append(torch.zeros(p.numel(), device=p.device))
+        return torch.cat(grads)                           # (total_params,)
+
+    def _set_flat_grad(self, flat: torch.Tensor) -> None:
+        offset = 0
+        for p in self._params:
+            n = p.numel()
+            if p.grad is not None:
+                p.grad.copy_(flat[offset: offset + n].view_as(p))
+            offset += n
+
+    def step(
+        self,
+        task_losses: List[torch.Tensor],
+        retain_graph: bool = False,
+    ) -> None:
+        """
+        Perform PCGrad update given a list of per-task scalar losses.
+
+        Each loss is backpropagated independently to obtain its gradient
+        vector.  Conflicting gradient pairs are then projected before
+        the final parameter update.
+        """
+        n_tasks = len(task_losses)
+        if n_tasks == 0:
+            return
+
+        # ── Step 1: Collect per-task flat gradient vectors ────────────────────
+        task_grads: List[torch.Tensor] = []
+        for i, loss in enumerate(task_losses):
+            self._opt.zero_grad()
+            retain = retain_graph or (i < n_tasks - 1)
+            loss.backward(retain_graph=retain)
+            task_grads.append(self._flatten_grad())
+
+        # ── Step 2: Project conflicting gradients ─────────────────────────────
+        proj_grads = [g.clone() for g in task_grads]
+
+        for i in range(n_tasks):
+            for j in range(n_tasks):
+                if i == j:
+                    continue
+                gi = proj_grads[i]
+                gj = task_grads[j]
+                dot = torch.dot(gi, gj)
+                if dot < 0:                              # conflicting direction
+                    norm_sq = gj.dot(gj).clamp(min=1e-12)
+                    proj_grads[i] = gi - (dot / norm_sq) * gj
+
+        # ── Step 3: Sum projected gradients and load into .grad ───────────────
+        final_grad = torch.stack(proj_grads, dim=0).sum(dim=0)
+        self._opt.zero_grad()
+        self._set_flat_grad(final_grad)
+
+        # ── Step 4: Optimizer step ────────────────────────────────────────────
+        self._opt.step()
+
+    def state_dict(self) -> Dict:
+        return self._opt.state_dict()
+
+    def load_state_dict(self, sd: Dict) -> None:
+        self._opt.load_state_dict(sd)
+
+    @property
+    def param_groups(self):
+        return self._opt.param_groups
+
