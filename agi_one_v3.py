@@ -2083,3 +2083,233 @@ class MPPIPlanner(nn.Module):
         best_action, _ = self.plan(world_model, h, z, **kwargs)
         return best_action
 
+
+# =============================================================================
+# SECTION 9 — MEMORY MODULES (preserved + upgraded with SSC)
+# =============================================================================
+
+class WorkingMemoryModule(nn.Module):
+    """
+    Short-term working memory with SSCStabilizer [v2.0 upgrade].
+    N attention-gated slots.
+    """
+
+    def __init__(self, n_slots: int, latent_dim: int,
+                 n_heads: int, device: torch.device) -> None:
+        super().__init__()
+        self.n_slots    = n_slots
+        self.latent_dim = latent_dim
+        self.device     = device
+
+        self.register_buffer("slots", torch.zeros(n_slots, latent_dim))
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=latent_dim, nhead=n_heads,
+            dim_feedforward=latent_dim * 2,
+            dropout=0.0, batch_first=True, norm_first=True,
+        )
+        self.slot_transformer = nn.TransformerEncoder(enc_layer, num_layers=2)
+        self.gate         = nn.Sequential(
+            nn.Linear(latent_dim * 2, latent_dim), nn.Sigmoid(),
+        )
+        self.read_query   = nn.Linear(latent_dim, latent_dim)
+        self.read_key     = nn.Linear(latent_dim, latent_dim)
+        self.read_value   = nn.Linear(latent_dim, latent_dim)
+        self.ssc_stab     = SSCStabilizer(latent_dim)  # [v2.0]
+        self.to(device)
+
+    def write(self, c: torch.Tensor) -> None:
+        if c.dim() == 1: c = c.unsqueeze(0)
+        sim     = F.cosine_similarity(c, self.slots, dim=-1)
+        idx     = int(sim.argmin().item())
+        old     = self.slots[idx].unsqueeze(0)
+        g       = self.gate(torch.cat([old, c], dim=-1))
+        self.slots[idx] = (g * c + (1-g) * old).squeeze(0)
+
+    def read(self, q: torch.Tensor) -> torch.Tensor:
+        if q.dim() == 1: q = q.unsqueeze(0)
+        Q  = self.read_query(q)
+        K  = self.read_key(self.slots)
+        V  = self.read_value(self.slots)
+        w  = F.softmax((Q @ K.T) / math.sqrt(self.latent_dim), dim=-1)
+        return (w @ V).squeeze(0)
+
+    def process(self, inp: torch.Tensor) -> torch.Tensor:
+        if inp.dim() == 1: inp = inp.unsqueeze(0)
+        seq = torch.cat([self.slots.unsqueeze(0), inp.unsqueeze(0)], dim=1)
+        out = self.slot_transformer(seq)
+        out = self.ssc_stab(out)   # [v2.0]
+        return out[0, -1, :]
+
+    def reset(self) -> None: self.slots.zero_()
+
+    def forward(self, inp: torch.Tensor) -> torch.Tensor:
+        ctx = self.process(inp)
+        self.write(inp)
+        return ctx
+
+
+class EpisodicMemoryModule(nn.Module):
+    """Long-term DND episodic memory — preserved from v1.0."""
+
+    def __init__(self, capacity: int, latent_dim: int, device: torch.device) -> None:
+        super().__init__()
+        self.capacity   = capacity
+        self.latent_dim = latent_dim
+        self.device     = device
+
+        self.register_buffer("keys",         torch.zeros(capacity, latent_dim))
+        self.register_buffer("values",       torch.zeros(capacity, latent_dim))
+        self.register_buffer("ages",         torch.zeros(capacity))
+        self.register_buffer("access_count", torch.zeros(capacity))
+        self._ptr  = 0
+        self._size = 0
+
+        self.key_encoder       = nn.Sequential(nn.Linear(latent_dim, latent_dim), nn.Tanh())
+        self.consolidation_proj= nn.Linear(latent_dim, latent_dim)
+        self.to(device)
+
+    def write(self, k: torch.Tensor, v: torch.Tensor) -> None:
+        k = self.key_encoder(k.detach()).squeeze(0)
+        v = v.detach().squeeze(0)
+        if self._size < self.capacity:
+            idx = self._ptr
+            self._size += 1
+        else:
+            score = self.ages * (1.0 / (self.access_count + 1.0))
+            idx   = int(score.argmax().item())
+        self.keys[idx] = k; self.values[idx] = v
+        self.ages[idx] = 0.0; self.access_count[idx] = 0.0
+        self._ptr = (self._ptr + 1) % self.capacity
+        self.ages[:self._size] += 1.0
+
+    def retrieve(self, q: torch.Tensor, top_k: int = 5,
+                 temperature: float = 0.1) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self._size == 0:
+            return torch.zeros(self.latent_dim, device=self.device), \
+                   torch.zeros(1, device=self.device)
+        q2   = self.key_encoder(q).squeeze(0)
+        sim  = F.cosine_similarity(q2.unsqueeze(0), self.keys[:self._size], dim=-1)
+        k    = min(top_k, self._size)
+        ts, ti = sim.topk(k)
+        self.access_count[ti] += 1.0
+        w    = F.softmax(ts / temperature, dim=0)
+        return (w.unsqueeze(-1) * self.values[ti]).sum(0), w
+
+    def forward(self, q: torch.Tensor,
+                write_v: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if write_v is not None: self.write(q, write_v)
+        r, _ = self.retrieve(q)
+        return r
+
+
+# =============================================================================
+# SECTION 10 — GLOBAL WORKSPACE MODULE (preserved + upgraded)
+# =============================================================================
+
+class GlobalWorkspaceModule(nn.Module):
+    """GWT broadcast consciousness — upgraded with SSCStabilizer [v2.0]."""
+
+    def __init__(self, latent_dim: int, n_modules: int, n_heads: int,
+                 device: torch.device, temp: float = 0.5) -> None:
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.temp       = temp
+        self.device     = device
+
+        self.saliency_net    = nn.Sequential(
+            nn.Linear(latent_dim, 128), nn.GELU(), nn.Linear(128, 1),
+        )
+        self.broadcast_proj  = nn.Linear(latent_dim, latent_dim)
+        self.register_buffer("workspace_state", torch.zeros(latent_dim))
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=latent_dim, nhead=n_heads,
+            dim_feedforward=latent_dim * 2,
+            dropout=0.0, batch_first=True, norm_first=True,
+        )
+        self.integrator  = nn.TransformerEncoder(enc_layer, num_layers=2)
+        self.ssc_stab    = SSCStabilizer(latent_dim)   # [v2.0]
+        self.to(device)
+
+    def forward(self, module_activations: Dict[str, torch.Tensor]
+                ) -> Tuple[torch.Tensor, str]:
+        names  = list(module_activations.keys())
+        vecs   = torch.stack([module_activations[n].to(self.device) for n in names], 0)
+        scores = self.saliency_net(vecs).squeeze(-1)
+        w      = F.softmax(scores / self.temp, dim=0)
+        bc     = self.broadcast_proj((w.unsqueeze(-1) * vecs).sum(0))
+        seq    = torch.stack([self.workspace_state.unsqueeze(0),
+                              bc.unsqueeze(0)], dim=1)
+        out    = self.integrator(seq)
+        out    = self.ssc_stab(out)   # [v2.0]
+        new_st = out[0, -1, :]
+        self.workspace_state = new_st.detach()
+        winner = names[int(w.argmax().item())]
+        return new_st, winner
+
+
+# =============================================================================
+# SECTION 11 — META-COGNITION (preserved + upgraded with CSOC)
+# =============================================================================
+
+class MetaCognitionModule(nn.Module):
+    """Self-model with CSOC-driven adaptive introspection [v2.0]."""
+
+    def __init__(self, latent_dim: int, n_strategies: int = 8,
+                 device: torch.device = torch.device("cpu")) -> None:
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.device     = device
+
+        self.strategy_net = nn.Sequential(
+            nn.Linear(latent_dim, 128), nn.GELU(), nn.Linear(128, n_strategies),
+        )
+        self.unc_net = nn.Sequential(
+            nn.Linear(latent_dim, 64), nn.GELU(),
+            nn.Linear(64, 2), nn.Softplus(),
+        )
+        self.load_net = nn.Sequential(
+            nn.Linear(latent_dim, 64), nn.GELU(), nn.Linear(64, 1), nn.Sigmoid(),
+        )
+        self.anomaly_enc = nn.Linear(latent_dim, latent_dim // 2)
+        self.anomaly_dec = nn.Linear(latent_dim // 2, latent_dim)
+
+        # CSOC compute controller for meta-cognition depth [v2.0]
+        self.csoc = CSOCComputeController(latent_dim, min_layers=1, max_layers=8)
+
+        self.register_buffer("history", torch.zeros(100, latent_dim))
+        self._ptr = 0
+        self.to(device)
+
+    def _update(self, ws: torch.Tensor) -> None:
+        self.history[self._ptr % 100] = ws.detach()
+        self._ptr += 1
+
+    def introspect(self, q: torch.Tensor) -> torch.Tensor:
+        n = min(self._ptr, 100)
+        if n == 0: return torch.zeros(self.latent_dim, device=self.device)
+        h = self.history[:n]
+        w = F.softmax(F.cosine_similarity(q.unsqueeze(0), h, dim=-1) / 0.1, dim=0)
+        return (w.unsqueeze(-1) * h).sum(0)
+
+    def forward(self, ws: torch.Tensor, ocd: bool = False) -> Dict[str, Any]:
+        self._update(ws)
+        unc_vals = self.unc_net(ws)
+        load     = float(self.load_net(ws).item())
+        recon    = self.anomaly_dec(self.anomaly_enc(ws))
+        anomaly  = float(F.mse_loss(recon, ws).item())
+        strat    = int(self.strategy_net(ws).argmax().item())
+        _, n_lay = self.csoc(ws.unsqueeze(0).unsqueeze(0))
+
+        return {
+            "strategy"       : strat,
+            "epistemic_unc"  : float(unc_vals[0].item()),
+            "aleatoric_unc"  : float(unc_vals[1].item()),
+            "cognitive_load" : load,
+            "anomaly_score"  : anomaly,
+            "ocd_alert"      : ocd,
+            "csoc_n_layers"  : n_lay,
+        }
+
+
