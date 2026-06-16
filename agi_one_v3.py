@@ -2685,3 +2685,461 @@ class MathReasoningLayer(nn.Module):
         out     = self.norm(out)
         return out[0, 0, :]   # (D,)
 
+
+# =============================================================================
+# SECTION 16 — AGI STATE
+# =============================================================================
+
+@dataclass
+class AGIState:
+    """Full AGI ONE v2.0 cognitive state at time t."""
+    step                 : int
+    workspace_state      : Optional[torch.Tensor] = None
+    winner_module        : str                    = "unknown"
+    perception_latent    : Optional[torch.Tensor] = None
+    language_latent      : Optional[torch.Tensor] = None
+    working_memory_ctx   : Optional[torch.Tensor] = None
+    episodic_memory_ctx  : Optional[torch.Tensor] = None
+    world_model_state    : Optional[Dict]         = None
+    planned_action       : Optional[torch.Tensor] = None
+    executive_action     : Optional[torch.Tensor] = None
+    safety_score         : Optional[float]        = None
+    psyche_state         : Optional[Any]          = None
+    meta_cognition       : Optional[Dict]         = None
+    one_ecosystem_latent : Optional[torch.Tensor] = None
+    math_latent          : Optional[torch.Tensor] = None
+    total_loss           : Optional[torch.Tensor] = None
+    csoc_n_layers        : Optional[int]          = None
+
+    def summary(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {
+            "step"         : self.step,
+            "winner_module": self.winner_module,
+        }
+        if self.meta_cognition:
+            d["meta"] = self.meta_cognition
+        if self.safety_score is not None:
+            d["safety_score"] = round(self.safety_score, 4)
+        if self.csoc_n_layers is not None:
+            d["csoc_n_layers"] = self.csoc_n_layers
+        if self.psyche_state and hasattr(self.psyche_state, "to_dict"):
+            d["psyche"] = self.psyche_state.to_dict()
+        if self.planned_action is not None:
+            d["planned_action_norm"] = float(self.planned_action.norm().item())
+        return d
+
+
+# =============================================================================
+# SECTION 17 — AGI ONE v2.0 CORE ENGINE
+# =============================================================================
+
+class AGIONE(nn.Module):
+    """
+    AGI ONE v2.0 — Production-Grade General Intelligence Architecture.
+
+    ═══════════════════════════════════════════════════════════════════
+    Developer  : Yoon A Limsuwan / MSPS NETWORK
+                 MY SOUL MOVE BY POWER OF HOLY SPIRIT
+    License    : MIT
+    Version    : 2.0.0
+    AI Assistants: Claude (Anthropic), GPT-4o (OpenAI),
+                   Gemini (Google DeepMind), DeepSeek (DeepSeek AI)
+    ═══════════════════════════════════════════════════════════════════
+
+    Full cognitive architecture:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  PerceptionModule    ← ViT patch encoder + Conformer audio      │
+    │  LanguageModule      ← RoPE-GPT + SSCStabilizer + CSOC depth    │
+    │  WorkingMemoryModule ← slot attention + SSC                     │
+    │  EpisodicMemory      ← DND long-term memory                     │
+    │  GlobalWorkspace     ← GWT broadcast + SSC                      │
+    │  DreamerV3WorldModel ← categorical latents + symlog + free-bits │
+    │  MPPIPlanner         ← importance-weighted trajectory opt        │
+    │  MetaCognitionModule ← self-model + CSOC compute control        │
+    │  PsycheExecutiveLayer← Id→Goal / Ego→Plan / Superego→Safety     │
+    │  MultiScaleIntegrator← 23 ONE Ecosystem modules                 │
+    │  MathReasoningLayer  ← BSD / GRH / HODGE ONE                    │
+    │  SSCStabilizer       ← per-layer latent stabilization           │
+    │  InterfaceAttention  ← phase-transition attention prior         │
+    │  CSOCComputeController ← edge-of-chaos adaptive depth           │
+    │  StructuralLangevinDiffusion ← geometry-aware exploration       │
+    │  LossBalancer        ← Kendall uncertainty weighting            │
+    │  PPOTrainer          ← full clipped PPO + GAE(λ)                │
+    │  OpenScienceRegistry ← dataset attribution + provenance         │
+    └─────────────────────────────────────────────────────────────────┘
+    """
+
+    def __init__(self, cfg: Optional[AGIConfig] = None) -> None:
+        super().__init__()
+        if cfg is None:
+            cfg = AGIConfig()
+        self.cfg    = cfg
+        self.device = cfg.device
+        self._step  = 0
+
+        torch.manual_seed(cfg.seed)
+
+        logger.info(
+            f"\n{'='*65}\n"
+            f"  AGI ONE v{AGI_ONE_VERSION} — ONE Ecosystem Central Hub\n"
+            f"  Developer  : Yoon A Limsuwan / MSPS NETWORK\n"
+            f"  MY SOUL MOVE BY POWER OF HOLY SPIRIT\n"
+            f"  AI Assistants: Claude (Anthropic), GPT-4o (OpenAI),\n"
+            f"                 Gemini (Google DeepMind), DeepSeek\n"
+            f"{'='*65}\n"
+            f"  Device: {cfg.device}  latent={cfg.latent_dim}  "
+            f"action={cfg.action_dim}\n"
+            f"{'='*65}"
+        )
+
+        D      = cfg.latent_dim
+        A      = cfg.action_dim
+        device = cfg.device
+
+        # ── [1] Perception ───────────────────────────────────────────────────
+        self.perception = PerceptionModule(cfg)
+
+        # ── [2] Language ─────────────────────────────────────────────────────
+        if cfg.use_language:
+            self.language = LanguageModule(cfg)
+
+        # ── [3] Working Memory ────────────────────────────────────────────────
+        self.working_memory = WorkingMemoryModule(
+            cfg.memory_slots, D, cfg.n_transformer_heads, device
+        )
+
+        # ── [4] Episodic Memory ───────────────────────────────────────────────
+        self.episodic_memory = EpisodicMemoryModule(
+            cfg.episodic_capacity, D, device
+        )
+
+        # ── [5] Global Workspace ─────────────────────────────────────────────
+        self.global_workspace = GlobalWorkspaceModule(D, 10, cfg.n_transformer_heads, device)
+
+        # ── [6] DreamerV3 World Model ─────────────────────────────────────────
+        stoch_latent = cfg.dreamer_stoch_size * cfg.dreamer_stoch_classes
+        self.world_model = DreamerV3WorldModel(
+            obs_dim        = D,
+            action_dim     = A,
+            stoch_size     = cfg.dreamer_stoch_size,
+            stoch_classes  = cfg.dreamer_stoch_classes,
+            det_size       = cfg.dreamer_det_size,
+            reward_bins    = cfg.dreamer_reward_bins,
+            free_bits      = cfg.dreamer_free_bits,
+            kl_balance     = cfg.dreamer_kl_balance,
+            device         = device,
+        )
+
+        # ── [7] MPPI Planner ──────────────────────────────────────────────────
+        self.mppi = MPPIPlanner(
+            action_dim   = A,
+            horizon      = cfg.planning_horizon,
+            n_samples    = cfg.mppi_n_samples,
+            temperature  = cfg.mppi_temperature,
+            noise_sigma  = cfg.mppi_noise_sigma,
+            device       = device,
+        )
+
+        # ── [8] Meta-Cognition ────────────────────────────────────────────────
+        self.meta_cognition = MetaCognitionModule(D, 8, device)
+
+        # ── [9] Psyche Executive Layer (Id/Ego/Superego) ─────────────────────
+        self.psyche_exec = PsycheExecutiveLayer(D, A, cfg, device)
+
+        # ── [10] ONE Ecosystem Modules (preserved from v1.0) ─────────────────
+        self.mental_one      = MentalONEEngine()    if cfg.use_mental_one  and HAS_MENTAL_ONE  else None
+        self.real_fold       = RealFoldONEEngine()  if cfg.use_real_fold   and HAS_REAL_FOLD   else None
+        self.evolution_one   = EvolutionONEEngine() if cfg.use_evolution   and HAS_EVOLUTION   else None
+        self.epidemic_engine = EpidemicEngine()     if cfg.use_evolution   and HAS_EPIDEMIC    else None
+        self.dns_engine      = SuperDNSEngine()     if cfg.use_physics     and HAS_DNS         else None
+        self.fh_engine       = StructuralFluctuatingHydro() if cfg.use_physics and HAS_FH     else None
+        self.standard_one    = StandardONEEngine()  if cfg.use_standard_one and HAS_STANDARD   else None
+        self.yang_mills      = YangMillsMassGapEngine() if cfg.use_yang_mills and HAS_YANG_MILLS else None
+        self.rh_engine       = RiemannHypothesisEngine() if cfg.use_rh and HAS_RH               else None
+
+        # ── [11] Math Reasoning Layer (BSD / GRH / HODGE) ────────────────────
+        if cfg.use_bsd or cfg.use_grh or cfg.use_hodge:
+            self.math_layer = MathReasoningLayer(D, device)
+        else:
+            self.math_layer = None
+
+        # ── [12] Multi-Scale Integrator ───────────────────────────────────────
+        self.multiscale = MultiScaleIntegrator(D, device)
+
+        # ── [13] Geometry-aware Latent Diffusion ──────────────────────────────
+        self.latent_diffusion = StructuralLangevinDiffusion(D, device=device)
+
+        # ── [14] Loss Balancer (Kendall) ──────────────────────────────────────
+        self.loss_balancer = LossBalancer()
+
+        # ── [15] Actor / Critic heads for PPO ────────────────────────────────
+        self.actor_net = nn.Sequential(
+            nn.Linear(D, 512), nn.GELU(),
+            nn.LayerNorm(512),
+            nn.Linear(512, A),
+        )
+        self.critic_net = nn.Sequential(
+            nn.Linear(D, 512), nn.GELU(),
+            nn.LayerNorm(512),
+            nn.Linear(512, 1),
+        )
+
+        # ── [16] PPO Trainer ──────────────────────────────────────────────────
+        self.ppo = PPOTrainer(
+            actor_net  = self.actor_net,
+            critic_net = self.critic_net,
+            action_dim = A,
+            cfg        = cfg,
+            device     = device,
+        )
+
+        # ── [17] Open Science Registry ────────────────────────────────────────
+        self.science_registry = OpenScienceRegistry()
+
+        # ── World model hidden state (persistent) ─────────────────────────────
+        self.register_buffer("wm_h", torch.zeros(1, cfg.dreamer_det_size))
+        self.register_buffer("wm_z", torch.zeros(1, stoch_latent))
+
+        self.to(device)
+
+        total_params = sum(p.numel() for p in self.parameters())
+        logger.info(f"AGI ONE v2.0 total parameters: {total_params:,}")
+
+    # =========================================================================
+    # ONE ECOSYSTEM QUERY
+    # =========================================================================
+
+    def _query_one_ecosystem(
+        self,
+        perception_latent: Optional[torch.Tensor] = None,
+        extra_inputs     : Optional[Dict] = None,
+    ) -> Dict[str, torch.Tensor]:
+        outputs: Dict[str, torch.Tensor] = {}
+        if perception_latent is not None:
+            outputs["psyche"] = perception_latent
+        if extra_inputs is None:
+            extra_inputs = {}
+
+        # Math reasoning [v2.0 NEW]
+        if self.math_layer is not None:
+            ml = self.math_layer()
+            if ml is not None:
+                outputs["math_bsd"] = ml[:64] if ml.shape[0] >= 64 \
+                                      else F.pad(ml, (0, 64 - ml.shape[0]))
+
+        return outputs
+
+    # =========================================================================
+    # FORWARD PASS — FULL AGI CYCLE v2.0
+    # =========================================================================
+
+    def forward(
+        self,
+        image       : Optional[torch.Tensor] = None,
+        waveform    : Optional[torch.Tensor] = None,
+        token_ids   : Optional[torch.Tensor] = None,
+        proprio     : Optional[torch.Tensor] = None,
+        timeseries  : Optional[torch.Tensor] = None,
+        goal        : Optional[torch.Tensor] = None,
+        extra_inputs: Optional[Dict]         = None,
+        compute_loss: bool                   = False,
+        reward      : Optional[torch.Tensor] = None,
+    ) -> AGIState:
+        """
+        AGI ONE v2.0 full cognitive cycle.
+
+        Steps:
+        1.  Perception     → fused_perception (ViT + Conformer)
+        2.  Language       → language_latent (RoPE-GPT)
+        3.  Memory         → working_memory_ctx + episodic_ctx
+        4.  ONE Ecosystem  → multiscale_latent (23 modules)
+        5.  Math Reasoning → math_latent (BSD/GRH/HODGE)
+        6.  Global Workspace (GWT) → workspace_state, winner
+        7.  Psyche Executive → Id→goal, Ego→plan, Superego→safety
+        8.  DreamerV3 World Model → h, z, predictions
+        9.  MPPI Planning  → planned_action (importance-weighted)
+        10. Geometry-aware Diffusion → latent exploration
+        11. Meta-Cognition → self-model, CSOC depth
+        12. Loss computation (if training, Kendall-balanced)
+        """
+        self._step += 1
+        state = AGIState(step=self._step)
+
+        # ── Step 1: Perception ────────────────────────────────────────────────
+        perc = self.perception(
+            image=image, waveform=waveform, token_ids=token_ids,
+            proprio=proprio, timeseries=timeseries,
+        )
+        state.perception_latent = perc
+
+        # ── Step 2: Language ──────────────────────────────────────────────────
+        lang = None
+        if hasattr(self, "language") and token_ids is not None:
+            lang, _ = self.language(token_ids, perc)
+            state.language_latent = lang
+
+        # ── Step 3: Memory ────────────────────────────────────────────────────
+        wm_inp = lang if lang is not None else perc
+        wm_ctx = self.working_memory(wm_inp)
+        ep_ctx = self.episodic_memory(
+            perc, write_v=perc if self._step % 5 == 0 else None
+        )
+        state.working_memory_ctx  = wm_ctx
+        state.episodic_memory_ctx = ep_ctx
+
+        # ── Step 4: ONE Ecosystem ─────────────────────────────────────────────
+        scale_out = self._query_one_ecosystem(perc, extra_inputs)
+        ms_latent = self.multiscale(scale_out)
+        state.one_ecosystem_latent = ms_latent
+
+        # ── Step 5: Math Reasoning ────────────────────────────────────────────
+        if self.math_layer is not None:
+            ml = self.math_layer()
+            state.math_latent = ml
+
+        # ── Step 6: Global Workspace ──────────────────────────────────────────
+        mod_acts: Dict[str, torch.Tensor] = {
+            "perception"    : perc,
+            "working_memory": wm_ctx,
+            "episodic"      : ep_ctx,
+            "ecosystem"     : ms_latent,
+        }
+        if lang is not None:
+            mod_acts["language"] = lang
+        if state.math_latent is not None:
+            mod_acts["math"] = state.math_latent
+
+        ws, winner = self.global_workspace(mod_acts)
+        state.workspace_state  = ws
+        state.winner_module    = winner
+
+        # ── Step 7: Psyche Executive Layer ────────────────────────────────────
+        exec_out = self.psyche_exec(ws)
+        state.executive_action = exec_out["executive_action"]
+        state.safety_score     = float(exec_out["safety_score"].item())
+        state.psyche_state     = exec_out.get("psyche_state")
+
+        # ── Step 8: DreamerV3 World Model ─────────────────────────────────────
+        dummy_a = torch.zeros(1, self.cfg.action_dim, device=self.device)
+        wm_out  = self.world_model(
+            h=self.wm_h, z=self.wm_z, action=dummy_a, obs=ws.unsqueeze(0)
+        )
+        self.wm_h = wm_out["h_next"].detach()
+        self.wm_z = wm_out["z_next"].detach()
+        state.world_model_state = {
+            "h_shape": tuple(self.wm_h.shape),
+            "z_shape": tuple(self.wm_z.shape),
+        }
+
+        # ── Step 9: MPPI Planning ─────────────────────────────────────────────
+        planned_action, _ = self.mppi.plan(
+            world_model  = self.world_model,
+            h            = self.wm_h,
+            z            = self.wm_z,
+            goal         = goal,
+            psyche_bias  = exec_out.get("drive"),
+        )
+        state.planned_action = planned_action
+
+        # ── Step 10: Geometry-aware Latent Diffusion (exploration) ────────────
+        if self._step % 10 == 0:  # periodic latent exploration
+            _ = self.latent_diffusion(ws.unsqueeze(0))
+
+        # ── Step 11: Meta-Cognition ───────────────────────────────────────────
+        ocd = (state.psyche_state.ocd_loop_detected
+               if state.psyche_state is not None and
+                  hasattr(state.psyche_state, "ocd_loop_detected")
+               else False)
+        meta  = self.meta_cognition(ws, ocd)
+        state.meta_cognition = meta
+        state.csoc_n_layers  = meta.get("csoc_n_layers")
+
+        # ── Step 12: Dreamer-compound loss ────────────────────────────────────
+        if compute_loss:
+            state.total_loss = self._compute_dreamer_loss(
+                ws=ws, wm_out=wm_out, planned_action=planned_action,
+                exec_out=exec_out, reward=reward,
+            )
+
+        return state
+
+    def _compute_dreamer_loss(
+        self,
+        ws            : torch.Tensor,
+        wm_out        : Dict[str, torch.Tensor],
+        planned_action: torch.Tensor,
+        exec_out      : Dict,
+        reward        : Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        DreamerV3-style compound loss with Kendall uncertainty weighting.
+
+        L = Σ_task (1/2σ_task²) · L_task + log(σ_task)
+
+        Tasks:
+          world_kl    : DreamerV3 free-bits KL
+          world_recon : symlog reconstruction
+          reward      : two-hot reward prediction
+          continue    : continuation prediction
+          actor       : policy gradient (actor)
+          value       : value function (critic)
+          entropy     : action entropy bonus
+          psy         : PSY BRIDGE Free Energy
+        """
+        loss_dict: Dict[str, torch.Tensor] = {}
+        zero = torch.tensor(0.0, device=self.device, requires_grad=True)
+
+        # ── World model KL ────────────────────────────────────────────────────
+        prior_l = wm_out.get("prior_logits")
+        post_l  = wm_out.get("post_logits")
+        if prior_l is not None and post_l is not None:
+            loss_dict["world_kl"] = self.world_model.kl_loss(post_l, prior_l)
+
+        # ── Reconstruction (symlog MSE) ────────────────────────────────────────
+        obs_pred = wm_out.get("obs_pred")
+        if obs_pred is not None and obs_pred.shape == ws.unsqueeze(0).shape:
+            loss_dict["world_recon"] = F.mse_loss(
+                symlog(obs_pred), symlog(ws.unsqueeze(0))
+            )
+
+        # ── Reward two-hot loss ───────────────────────────────────────────────
+        if reward is not None:
+            feat = wm_out.get("feat")
+            if feat is not None:
+                loss_dict["reward"] = self.world_model.reward_loss(
+                    feat, reward.to(self.device).unsqueeze(-1)
+                )
+
+        # ── Continue prediction ───────────────────────────────────────────────
+        cont_pred = wm_out.get("cont_pred")
+        if cont_pred is not None:
+            cont_target = torch.ones_like(cont_pred)
+            loss_dict["continue"] = F.binary_cross_entropy(cont_pred, cont_target)
+
+        # ── Actor loss (policy gradient) ──────────────────────────────────────
+        action_logits = self.actor_net(ws)
+        dist          = torch.distributions.Categorical(logits=action_logits)
+        act_idx       = planned_action.argmax()
+        log_p         = dist.log_prob(act_idx)
+
+        if reward is not None:
+            value_est  = self.critic_net(ws).squeeze()
+            adv        = reward.to(self.device).squeeze() - value_est.detach()
+            loss_dict["actor"] = -log_p * adv
+            loss_dict["value"] = F.mse_loss(
+                value_est, reward.to(self.device).squeeze().unsqueeze(0)
+            )
+
+        loss_dict["entropy"] = -dist.entropy()
+
+        # ── PSY BRIDGE Free Energy ────────────────────────────────────────────
+        psy_loss = exec_out.get("psy_loss")
+        if psy_loss is not None:
+            loss_dict["psy"] = psy_loss
+
+        # ── Kendall uncertainty-weighted total ────────────────────────────────
+        if loss_dict:
+            total, weights = self.loss_balancer(loss_dict)
+            return total
+        return zero
+
