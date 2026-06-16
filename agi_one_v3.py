@@ -3558,3 +3558,228 @@ class PCGradOptimizer:
     def param_groups(self):
         return self._opt.param_groups
 
+
+
+# =============================================================================
+# SECTION 18-C — InfoNCE CROSS-MODAL ALIGNMENT LOSS  (v3.0 NEW)
+# CLIP-style contrastive alignment: physics latent ↔ language latent
+# Radford et al. 2021 / Chen et al. 2020 (SimCLR)
+# =============================================================================
+
+class CrossModalAlignmentLoss(nn.Module):
+    """
+    Symmetric InfoNCE (NT-Xent) loss aligning two latent spaces.
+
+    Given a batch of B paired embeddings from two domains (e.g. physics and
+    language), the loss pulls (physics_i, language_i) pairs together and
+    pushes (physics_i, language_j≠i) apart in the shared embedding space.
+
+    L = -½ [ mean_i log softmax(sim(p_i, L)/τ)[i]    # physics→language
+            + mean_i log softmax(sim(L_i, p)/τ)[i] ]  # language→physics
+
+    where sim(a, b) = a·b / (‖a‖·‖b‖)  (cosine similarity)
+
+    Usage:
+        align_loss = CrossModalAlignmentLoss(d_model=512, temperature=0.07)
+        loss = align_loss(physics_latent, language_latent)
+
+    If batch size B == 1, returns zero (no negatives to contrast against).
+    Both tensors must be (B, D).
+    """
+
+    def __init__(
+        self,
+        d_model     : int,
+        temperature : float = 0.07,
+        learnable_T : bool  = True,
+    ) -> None:
+        super().__init__()
+        self.d_model = d_model
+
+        # Learnable temperature (log-parameterised for numerical stability)
+        if learnable_T:
+            self.log_tau = nn.Parameter(torch.tensor(math.log(temperature)))
+        else:
+            self.register_buffer("log_tau", torch.tensor(math.log(temperature)))
+
+        # Shared projection MLP: both domains projected to alignment space
+        self.proj_physics  = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+        )
+        self.proj_language = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+    def forward(
+        self,
+        physics_latent : torch.Tensor,   # (B, D)
+        language_latent: torch.Tensor,   # (B, D)
+    ) -> torch.Tensor:
+        B = physics_latent.shape[0]
+        if B <= 1:
+            return torch.tensor(0.0, device=physics_latent.device, requires_grad=True)
+
+        p = F.normalize(self.proj_physics(physics_latent),  dim=-1)  # (B, D)
+        l = F.normalize(self.proj_language(language_latent), dim=-1)  # (B, D)
+
+        tau = self.log_tau.exp().clamp(min=1e-4, max=1.0)
+
+        # Cosine similarity matrix (B, B)
+        logits_pl = (p @ l.T) / tau        # physics-rows  → language-cols
+        logits_lp = (l @ p.T) / tau        # language-rows → physics-cols
+
+        labels = torch.arange(B, device=physics_latent.device)
+
+        loss_pl = F.cross_entropy(logits_pl, labels)
+        loss_lp = F.cross_entropy(logits_lp, labels)
+
+        return 0.5 * (loss_pl + loss_lp)
+
+
+# =============================================================================
+# SECTION 18-D — CURRICULUM SCHEDULER  (v3.0 NEW)
+# Three-phase curriculum control for AGITrainerV3
+# =============================================================================
+
+class TrainingPhase(Enum):
+    """Curriculum training phase."""
+    FOUNDATION = 1   # Physics/math surrogates + DreamerV3 world model
+    ALIGNMENT  = 2   # Freeze physics backbone; language↔physics InfoNCE bridge
+    COGNITIVE  = 3   # PPO + Psyche; fine-tune with PCGrad; full policy
+
+
+@dataclass
+class CurriculumConfig:
+    """
+    Configuration for three-phase curriculum training.
+
+    Attributes:
+        phase1_steps : Steps to train in FOUNDATION phase.
+        phase2_steps : Steps to train in ALIGNMENT phase.
+        phase3_steps : Steps to train in COGNITIVE phase (or -1 = indefinite).
+        align_loss_weight  : InfoNCE alignment loss weight (Phase 2+3).
+        pcgrad_enabled     : Whether to use PCGrad in Phase 3.
+        phase1_convergence_patience : Switch to Phase 2 early if world-model
+                                      loss has not improved for this many steps.
+    """
+    phase1_steps               : int   = 5_000
+    phase2_steps               : int   = 5_000
+    phase3_steps               : int   = -1       # indefinite
+    align_loss_weight          : float = 0.1
+    pcgrad_enabled             : bool  = True
+    phase1_convergence_patience: int   = 500
+
+
+class CurriculumScheduler:
+    """
+    Manages curriculum phase transitions for AGITrainerV3.
+
+    Tracks global step count and fires phase transition callbacks.
+    Also implements early-switch to Phase 2 if the world-model loss
+    has converged (patience mechanism).
+
+    Usage:
+        scheduler = CurriculumScheduler(curriculum_cfg, orchestrator)
+        # In trainer loop:
+        scheduler.on_step(global_step, loss_metrics)
+        phase = scheduler.current_phase
+    """
+
+    def __init__(
+        self,
+        cfg         : CurriculumConfig,
+        orchestrator: EcosystemOrchestrator,
+    ) -> None:
+        self.cfg           = cfg
+        self.orchestrator  = orchestrator
+        self._phase        = TrainingPhase.FOUNDATION
+        self._best_wm_loss = float("inf")
+        self._patience_ctr = 0
+        self._callbacks: Dict[TrainingPhase, List[Callable]] = {
+            TrainingPhase.FOUNDATION: [],
+            TrainingPhase.ALIGNMENT : [],
+            TrainingPhase.COGNITIVE : [],
+        }
+        # Apply Phase 1 immediately
+        self._enter_phase(TrainingPhase.FOUNDATION)
+
+    # ── Phase transition ──────────────────────────────────────────────────────
+
+    def _enter_phase(self, phase: TrainingPhase) -> None:
+        self._phase = phase
+        self.orchestrator.apply_curriculum_phase(phase.value)
+        for cb in self._callbacks.get(phase, []):
+            cb()
+        logger.info(
+            f"CurriculumScheduler ══► Phase {phase.value} ({phase.name}) STARTED"
+        )
+
+    def register_callback(self, phase: TrainingPhase, fn: Callable) -> None:
+        """Register a callback fired when transitioning into a phase."""
+        self._callbacks[phase].append(fn)
+
+    # ── Per-step update ───────────────────────────────────────────────────────
+
+    def on_step(
+        self,
+        global_step  : int,
+        loss_metrics : Dict[str, float],
+    ) -> TrainingPhase:
+        """
+        Update phase based on step count and optional early convergence.
+        Returns the current phase after any transition.
+        """
+        p1_end = self.cfg.phase1_steps
+        p2_end = p1_end + self.cfg.phase2_steps
+
+        # ── Phase 1 → 2 transition ────────────────────────────────────────────
+        if self._phase == TrainingPhase.FOUNDATION:
+            wm_loss = loss_metrics.get("world_kl", loss_metrics.get("total_loss", 1e9))
+
+            # Early convergence check (patience)
+            if wm_loss < self._best_wm_loss - 1e-4:
+                self._best_wm_loss = wm_loss
+                self._patience_ctr = 0
+            else:
+                self._patience_ctr += 1
+
+            early_converge = (
+                self._patience_ctr >= self.cfg.phase1_convergence_patience
+            )
+            if global_step >= p1_end or early_converge:
+                reason = "early-convergence" if early_converge else "step-limit"
+                logger.info(f"CurriculumScheduler: Phase 1 exit [{reason}]")
+                self._enter_phase(TrainingPhase.ALIGNMENT)
+                self._patience_ctr = 0
+
+        # ── Phase 2 → 3 transition ────────────────────────────────────────────
+        elif self._phase == TrainingPhase.ALIGNMENT:
+            if global_step >= p2_end:
+                self._enter_phase(TrainingPhase.COGNITIVE)
+
+        # Phase 3 runs until manually stopped (or phase3_steps if set)
+        elif self._phase == TrainingPhase.COGNITIVE:
+            if (
+                self.cfg.phase3_steps > 0
+                and global_step >= p2_end + self.cfg.phase3_steps
+            ):
+                logger.info("CurriculumScheduler: Phase 3 complete.")
+
+        return self._phase
+
+    @property
+    def current_phase(self) -> TrainingPhase:
+        return self._phase
+
+    def is_phase(self, phase: TrainingPhase) -> bool:
+        return self._phase == phase
+
+    def phase_name(self) -> str:
+        return self._phase.name
+
