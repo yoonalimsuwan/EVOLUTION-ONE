@@ -3783,3 +3783,792 @@ class CurriculumScheduler:
     def phase_name(self) -> str:
         return self._phase.name
 
+
+# =============================================================================
+# SECTION 18 — AGI TRAINER v2.0
+# Full Dreamer + PPO + PSY compound training
+# =============================================================================
+
+class AGITrainer:
+    """
+    AGI ONE v2.0 Unified Trainer.
+
+    Combines:
+    [1] DreamerV3 world model training
+        - KL (free-bits) + reconstruction + reward (two-hot) + continue
+    [2] PPO actor-critic (on imagined trajectories from world model)
+    [3] PSY BRIDGE Free Energy minimization
+    [4] Language modelling auxiliary loss
+    [5] Kendall uncertainty-weighted loss balancing
+    [6] AMP mixed precision
+    [7] Gradient clipping
+    [8] Warmup + cosine LR scheduling
+    [9] DDP-ready (call torch.nn.parallel.DistributedDataParallel externally)
+    """
+
+    def __init__(
+        self,
+        model : AGIONE,
+        cfg   : Optional[AGIConfig] = None,
+    ) -> None:
+        self.model  = model
+        self.cfg    = cfg or model.cfg
+        self.device = model.device
+
+        # Separate optimizer for world model vs policy vs loss balancer
+        self.opt_world = torch.optim.AdamW(
+            list(model.world_model.parameters()),
+            lr=self.cfg.lr, weight_decay=self.cfg.weight_decay,
+        )
+        self.opt_policy = torch.optim.AdamW(
+            list(model.actor_net.parameters()) +
+            list(model.critic_net.parameters()) +
+            list(model.psyche_exec.parameters()),
+            lr=self.cfg.lr * 3,   # policy learns faster
+            weight_decay=self.cfg.weight_decay,
+        )
+        self.opt_balance = torch.optim.Adam(
+            model.loss_balancer.parameters(), lr=1e-3
+        )
+        self.opt_perception = torch.optim.AdamW(
+            list(model.perception.parameters()),
+            lr=self.cfg.lr * 0.3,  # perception slower
+        )
+
+        # Warmup + cosine LR
+        def warmup_cosine(step):
+            w = self.cfg.warmup_steps
+            if step < w:
+                return float(step) / max(w, 1)
+            progress = (step - w) / max(1, 10_000 - w)
+            return 0.5 * (1 + math.cos(math.pi * progress))
+
+        self.schedulers = [
+            torch.optim.lr_scheduler.LambdaLR(o, warmup_cosine)
+            for o in [self.opt_world, self.opt_policy,
+                      self.opt_balance, self.opt_perception]
+        ]
+
+        self.scaler = GradScaler(
+            enabled=self.cfg.use_amp and torch.cuda.is_available()
+        )
+
+        self.train_stats: Dict[str, List[float]] = {
+            "total_loss": [], "kl": [], "recon": [],
+            "reward_loss": [], "actor": [], "value": [],
+            "entropy": [], "psy": [],
+        }
+        self._global_step = 0
+
+        logger.info(
+            f"AGITrainer v2.0 initialized  |  "
+            f"warmup={self.cfg.warmup_steps}  amp={self.cfg.use_amp}"
+        )
+
+    def step(
+        self,
+        observation: Dict[str, Optional[torch.Tensor]],
+        reward     : Optional[torch.Tensor] = None,
+        done       : bool = False,
+    ) -> Dict[str, float]:
+        """
+        Single training step.
+
+        Returns stats dict.
+        """
+        self.model.train()
+
+        for opt in [self.opt_world, self.opt_policy,
+                    self.opt_balance, self.opt_perception]:
+            opt.zero_grad()
+
+        with autocast(enabled=self.cfg.use_amp and torch.cuda.is_available()):
+            agi_state = self.model(
+                **observation,
+                compute_loss = True,
+                reward       = reward,
+            )
+
+        if agi_state.total_loss is None or not agi_state.total_loss.requires_grad:
+            return {"loss": 0.0}
+
+        self.scaler.scale(agi_state.total_loss).backward()
+
+        for opt in [self.opt_world, self.opt_policy,
+                    self.opt_balance, self.opt_perception]:
+            self.scaler.unscale_(opt)
+
+        all_params = list(self.model.parameters())
+        torch.nn.utils.clip_grad_norm_(all_params, self.cfg.grad_clip_norm)
+
+        for opt in [self.opt_world, self.opt_policy,
+                    self.opt_balance, self.opt_perception]:
+            self.scaler.step(opt)
+
+        self.scaler.update()
+
+        for sched in self.schedulers:
+            sched.step()
+
+        self._global_step += 1
+
+        # PPO buffer update
+        if agi_state.workspace_state is not None and reward is not None:
+            ws = agi_state.workspace_state.detach()
+            self.model.ppo.buffer.obs.append(ws)
+            if agi_state.planned_action is not None:
+                self.model.ppo.buffer.actions.append(
+                    agi_state.planned_action.detach()
+                )
+            self.model.ppo.buffer.rewards.append(float(reward.item()))
+            val = float(self.model.critic_net(ws).detach().item())
+            self.model.ppo.buffer.values.append(val)
+            act_logits = self.model.actor_net(ws)
+            lp = F.log_softmax(act_logits, dim=-1)
+            self.model.ppo.buffer.log_probs.append(lp.max().detach())
+            self.model.ppo.buffer.dones.append(done)
+
+            # Run PPO update every 128 steps
+            if len(self.model.ppo.buffer) >= 128:
+                ppo_stats = self.model.ppo.update()
+                logger.debug(f"PPO update: {ppo_stats}")
+
+        loss_val = float(agi_state.total_loss.detach().item())
+        self.train_stats["total_loss"].append(loss_val)
+
+        return {
+            "loss"          : loss_val,
+            "winner_module" : agi_state.winner_module,
+            "safety_score"  : agi_state.safety_score or 0.0,
+            "csoc_n_layers" : agi_state.csoc_n_layers or 0,
+            "global_step"   : self._global_step,
+            "lr_world"      : self.schedulers[0].get_last_lr()[0],
+        }
+
+    def train(
+        self,
+        observations : List[Dict],
+        rewards      : Optional[List] = None,
+        n_steps      : int = 1000,
+        eval_every   : int = 100,
+    ) -> None:
+        logger.info(f"AGITrainer v2.0: training for {n_steps} steps")
+        for step in range(n_steps):
+            idx    = step % len(observations)
+            obs    = observations[idx]
+            rwd    = torch.tensor(rewards[idx]) if rewards else None
+            stats  = self.step(obs, rwd)
+
+            if step % eval_every == 0:
+                logger.info(
+                    f"Step {step:5d}  loss={stats.get('loss',0):.4f}  "
+                    f"winner={stats.get('winner_module','?')}  "
+                    f"safety={stats.get('safety_score',0):.3f}  "
+                    f"csoc_layers={stats.get('csoc_n_layers',0)}  "
+                    f"lr={stats.get('lr_world',0):.2e}"
+                )
+        logger.info("AGITrainer v2.0: training complete")
+
+    def save_checkpoint(self, path: str) -> None:
+        torch.save({
+            "model_state"     : self.model.state_dict(),
+            "opt_world"       : self.opt_world.state_dict(),
+            "opt_policy"      : self.opt_policy.state_dict(),
+            "opt_balance"     : self.opt_balance.state_dict(),
+            "train_stats"     : self.train_stats,
+            "global_step"     : self._global_step,
+            "agi_version"     : AGI_ONE_VERSION,
+            "science_registry": self.model.science_registry.provenance_report(),
+        }, path)
+        logger.info(f"Checkpoint saved: {path}")
+
+    def load_checkpoint(self, path: str) -> None:
+        ckpt = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(ckpt["model_state"])
+        self.opt_world.load_state_dict(ckpt["opt_world"])
+        self.opt_policy.load_state_dict(ckpt["opt_policy"])
+        self.opt_balance.load_state_dict(ckpt["opt_balance"])
+        self.train_stats   = ckpt.get("train_stats", self.train_stats)
+        self._global_step  = ckpt.get("global_step", 0)
+        logger.info(f"Checkpoint loaded: {path}  (step={self._global_step})")
+
+
+# =============================================================================
+# SECTION 18-E — AGI TRAINER v3.0  (v3.0 NEW)
+# Distributed Ecosystem + Curriculum + PCGrad + InfoNCE + Decoupled Optimizers
+# =============================================================================
+
+class AGITrainerV3:
+    """
+    AGI ONE v3.0 Unified Trainer — Stable Multi-Task Learning.
+
+    Solves the Gradient Interference problem of v2.0 via:
+
+    [A] CurriculumScheduler   — 3-phase staged training
+    [B] EcosystemOrchestrator — surrogate modules trained/frozen independently
+    [C] CrossModalAlignmentLoss — InfoNCE physics↔language geometric alignment
+    [D] PCGradOptimizer       — gradient surgery for conflicting tasks (Phase 3)
+    [E] Decoupled Optimizers  — per-domain learning rates
+
+    Optimizer map (Decoupled Optimizers):
+    ─────────────────────────────────────────────────────────────────────────
+    Group              Optimizer   LR       Rationale
+    ─────────────────────────────────────────────────────────────────────────
+    physics_surrogates AdamW       1e-6     High-precision PDE; very sensitive
+    math_surrogates    AdamW       5e-7     Discrete logic; extreme sensitivity
+    language_module    AdamW       1e-5     Standard LLM fine-tuning regime
+    world_model        AdamW       3e-4     DreamerV3 nominal
+    policy_heads       AdamW       1e-4     PPO actor + critic
+    psyche_layer       AdamW       3e-4     Free Energy minimisation
+    align_proj         AdamW       1e-4     InfoNCE projection heads
+    loss_balancer      Adam        1e-3     Kendall σ params (fast convergence)
+    ─────────────────────────────────────────────────────────────────────────
+
+    Phase-specific active optimizers:
+      Phase 1 — FOUNDATION : world_model + (ecosystem surrogates, independent)
+      Phase 2 — ALIGNMENT  : align_proj + language_module
+      Phase 3 — COGNITIVE  : policy_heads + psyche_layer (+ PCGrad across all)
+    """
+
+    def __init__(
+        self,
+        model           : "AGIONE",
+        orchestrator    : EcosystemOrchestrator,
+        cfg             : Optional[AGIConfig]      = None,
+        curriculum_cfg  : Optional[CurriculumConfig] = None,
+    ) -> None:
+        self.model        = model
+        self.orchestrator = orchestrator
+        self.cfg          = cfg or model.cfg
+        self.device       = model.device
+
+        curriculum_cfg = curriculum_cfg or CurriculumConfig()
+
+        # ── Cross-modal alignment loss ─────────────────────────────────────────
+        self.align_loss = CrossModalAlignmentLoss(
+            d_model     = self.cfg.latent_dim,
+            temperature = 0.07,
+            learnable_T = True,
+        ).to(self.device)
+
+        # ── Curriculum scheduler ───────────────────────────────────────────────
+        self.curriculum = CurriculumScheduler(curriculum_cfg, orchestrator)
+
+        # ── Decoupled Optimizers ──────────────────────────────────────────────
+        # World model
+        self.opt_world = torch.optim.AdamW(
+            list(model.world_model.parameters()),
+            lr=3e-4, weight_decay=self.cfg.weight_decay,
+        )
+        # Policy heads (actor + critic + MPPI)
+        self.opt_policy = torch.optim.AdamW(
+            list(model.actor_net.parameters()) +
+            list(model.critic_net.parameters()),
+            lr=1e-4, weight_decay=self.cfg.weight_decay,
+        )
+        # Psyche Executive (Free Energy)
+        self.opt_psyche = torch.optim.AdamW(
+            list(model.psyche_exec.parameters()),
+            lr=3e-4, weight_decay=self.cfg.weight_decay,
+        )
+        # Language module (standard LLM fine-tune regime)
+        lang_params = list(model.language.parameters()) if hasattr(model, "language") else []
+        self.opt_language = torch.optim.AdamW(
+            lang_params, lr=1e-5, weight_decay=self.cfg.weight_decay,
+        ) if lang_params else None
+
+        # InfoNCE alignment projections
+        self.opt_align = torch.optim.AdamW(
+            list(self.align_loss.parameters()), lr=1e-4,
+        )
+
+        # Loss balancer (Kendall σ)
+        self.opt_balance = torch.optim.Adam(
+            model.loss_balancer.parameters(), lr=1e-3,
+        )
+
+        # Perception (slow)
+        self.opt_perception = torch.optim.AdamW(
+            list(model.perception.parameters()),
+            lr=self.cfg.lr * 0.3,
+        )
+
+        # Domain surrogate optimizers (per-domain LR via EcosystemOrchestrator)
+        self._domain_opts: Dict[str, torch.optim.Optimizer] = {}
+        domain_lr = {
+            "physics"    : 1e-6,
+            "fold"       : 1e-6,
+            "evolution"  : 1e-6,
+            "mental"     : 1e-6,
+            "math"       : 5e-7,
+            "hodge"      : 5e-7,
+        }
+        param_groups = orchestrator.param_groups_by_domain()
+        for domain, params in param_groups.items():
+            if params:
+                lr = domain_lr.get(domain, 1e-6)
+                self._domain_opts[domain] = torch.optim.AdamW(
+                    params, lr=lr, weight_decay=self.cfg.weight_decay,
+                )
+                logger.info(
+                    f"AGITrainerV3: domain optimizer '{domain}'  "
+                    f"lr={lr}  params={len(params)}"
+                )
+
+        # ── PCGrad wrapper (Phase 3) — wraps policy optimizer ─────────────────
+        self.pcgrad = PCGradOptimizer(self.opt_policy)
+
+        # ── Warmup + Cosine LR schedulers ────────────────────────────────────
+        def _warmup_cos(step: int) -> float:
+            w = self.cfg.warmup_steps
+            if step < w:
+                return float(step) / max(w, 1)
+            progress = (step - w) / max(1, 50_000 - w)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        _base_opts = [
+            self.opt_world, self.opt_policy, self.opt_psyche,
+            self.opt_balance, self.opt_perception,
+        ]
+        if self.opt_language:
+            _base_opts.append(self.opt_language)
+
+        self._schedulers = [
+            torch.optim.lr_scheduler.LambdaLR(o, _warmup_cos) for o in _base_opts
+        ]
+
+        # ── AMP scaler ────────────────────────────────────────────────────────
+        self.scaler = GradScaler(
+            enabled=self.cfg.use_amp and torch.cuda.is_available()
+        )
+
+        # ── Stats ─────────────────────────────────────────────────────────────
+        self.train_stats: Dict[str, List[float]] = {
+            "total_loss": [], "align_loss": [], "world_kl": [],
+            "actor": [], "value": [], "psy": [], "phase": [],
+        }
+        self._global_step = 0
+
+        logger.info(
+            f"AGITrainerV3 initialized  |  "
+            f"curriculum={curriculum_cfg}  "
+            f"pcgrad={curriculum_cfg.pcgrad_enabled}  "
+            f"amp={self.cfg.use_amp}"
+        )
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _all_base_opts(self) -> List[torch.optim.Optimizer]:
+        opts = [
+            self.opt_world, self.opt_policy, self.opt_psyche,
+            self.opt_balance, self.opt_perception, self.opt_align,
+        ]
+        if self.opt_language:
+            opts.append(self.opt_language)
+        return opts
+
+    def _zero_all(self) -> None:
+        for opt in self._all_base_opts():
+            opt.zero_grad()
+        for opt in self._domain_opts.values():
+            opt.zero_grad()
+
+    def _clip_and_step(self, opts: List[torch.optim.Optimizer]) -> None:
+        for opt in opts:
+            for group in opt.param_groups:
+                torch.nn.utils.clip_grad_norm_(
+                    group["params"], self.cfg.grad_clip_norm
+                )
+        for opt in opts:
+            self.scaler.step(opt)
+
+    # ── Phase-specific training steps ─────────────────────────────────────────
+
+    def _step_phase1(
+        self,
+        observation: Dict[str, Optional[torch.Tensor]],
+        reward     : Optional[torch.Tensor],
+    ) -> Dict[str, float]:
+        """
+        Phase 1 — FOUNDATION
+        Train: DreamerV3 world model + perception encoder.
+        Ecosystem surrogates train independently via their own optimizers.
+        """
+        self.model.train()
+        self._zero_all()
+
+        with autocast(enabled=self.cfg.use_amp and torch.cuda.is_available()):
+            agi_state = self.model(
+                **observation, compute_loss=True, reward=reward,
+            )
+
+        if agi_state.total_loss is None or not agi_state.total_loss.requires_grad:
+            return {"loss": 0.0, "phase": 1}
+
+        self.scaler.scale(agi_state.total_loss).backward()
+
+        # Only step world model + perception in Phase 1
+        active_opts = [self.opt_world, self.opt_perception, self.opt_balance]
+        for opt in active_opts:
+            self.scaler.unscale_(opt)
+        self._clip_and_step(active_opts)
+        self.scaler.update()
+
+        # Also step domain surrogate optimizers (independent surrogate training)
+        for opt in self._domain_opts.values():
+            opt.step()
+
+        return {
+            "loss"      : float(agi_state.total_loss.detach().item()),
+            "phase"     : 1,
+            "world_kl"  : float(agi_state.total_loss.detach().item()),
+        }
+
+    def _step_phase2(
+        self,
+        observation: Dict[str, Optional[torch.Tensor]],
+        reward     : Optional[torch.Tensor],
+    ) -> Dict[str, float]:
+        """
+        Phase 2 — ALIGNMENT
+        Train: InfoNCE cross-modal alignment (physics↔language).
+        Surrogate backbones are frozen; only projection heads + language module update.
+        """
+        self.model.train()
+        self._zero_all()
+
+        with autocast(enabled=self.cfg.use_amp and torch.cuda.is_available()):
+            agi_state = self.model(**observation, compute_loss=False, reward=reward)
+
+            # Get physics and language latents for InfoNCE
+            ecosystem_latents = self.orchestrator(agi_state.perception_latent)
+            physics_latent = ecosystem_latents.get(
+                "domain_physics",
+                ecosystem_latents.get("ecosystem", agi_state.perception_latent),
+            )
+            lang_latent = (
+                agi_state.language_latent
+                if agi_state.language_latent is not None
+                else agi_state.perception_latent
+            )
+
+            # InfoNCE loss: align physics representation ↔ language representation
+            align_loss = self.align_loss(physics_latent, lang_latent)
+            align_loss = align_loss * self.curriculum.cfg.align_loss_weight
+
+        self.scaler.scale(align_loss).backward()
+
+        # Only update alignment projections + language module in Phase 2
+        active_opts = [self.opt_align]
+        if self.opt_language:
+            active_opts.append(self.opt_language)
+        for opt in active_opts:
+            self.scaler.unscale_(opt)
+        self._clip_and_step(active_opts)
+        self.scaler.update()
+
+        align_val = float(align_loss.detach().item())
+        return {
+            "loss"       : align_val,
+            "align_loss" : align_val,
+            "phase"      : 2,
+        }
+
+    def _step_phase3(
+        self,
+        observation: Dict[str, Optional[torch.Tensor]],
+        reward     : Optional[torch.Tensor],
+        done       : bool,
+    ) -> Dict[str, float]:
+        """
+        Phase 3 — COGNITIVE
+        Train: PPO policy + PsycheExecutiveLayer with PCGrad gradient surgery.
+        Alignment loss maintained; world model fine-tuned at slow rate.
+
+        Loss taxonomy for PCGrad task separation:
+          task_losses[0] = world_model_loss   (DreamerV3 KL + recon)
+          task_losses[1] = policy_loss        (PPO actor + value)
+          task_losses[2] = psyche_loss        (Free Energy)
+          task_losses[3] = align_loss         (InfoNCE — optional if batch>1)
+        """
+        self.model.train()
+
+        # ── Collect per-task losses (separate backward passes for PCGrad) ──────
+        task_losses: List[torch.Tensor] = []
+        stats: Dict[str, float]         = {"phase": 3}
+
+        with autocast(enabled=self.cfg.use_amp and torch.cuda.is_available()):
+            agi_state = self.model(
+                **observation, compute_loss=True, reward=reward,
+            )
+
+        # Task 0: World model loss
+        if (
+            agi_state.total_loss is not None
+            and agi_state.total_loss.requires_grad
+        ):
+            task_losses.append(agi_state.total_loss)
+            stats["world_loss"] = float(agi_state.total_loss.detach().item())
+
+        # Task 1: Policy loss (actor + value from PPO buffer)
+        if agi_state.workspace_state is not None and reward is not None:
+            ws  = agi_state.workspace_state
+            val = self.model.critic_net(ws).squeeze()
+            rwd = reward.to(self.device).squeeze()
+
+            act_logits = self.model.actor_net(ws)
+            dist       = torch.distributions.Categorical(logits=act_logits)
+            if agi_state.planned_action is not None:
+                log_p = dist.log_prob(agi_state.planned_action.argmax())
+                adv   = (rwd - val.detach()).clamp(-10, 10)
+                actor_loss = -(log_p * adv)
+                value_loss = F.mse_loss(val, rwd.unsqueeze(0))
+                entropy_loss = -self.cfg.entropy_coef * dist.entropy()
+                policy_loss  = actor_loss + self.cfg.value_loss_coef * value_loss + entropy_loss
+                task_losses.append(policy_loss)
+                stats["policy_loss"] = float(policy_loss.detach().item())
+
+        # Task 2: Psyche Free Energy
+        if agi_state.workspace_state is not None:
+            exec_out  = self.model.psyche_exec(agi_state.workspace_state)
+            psy_loss  = exec_out.get("psy_loss")
+            if psy_loss is not None and psy_loss.requires_grad:
+                task_losses.append(psy_loss)
+                stats["psy_loss"] = float(psy_loss.detach().item())
+
+        # Task 3: Alignment loss (InfoNCE — only if batch > 1 possible)
+        if agi_state.language_latent is not None:
+            eco_out   = self.orchestrator(agi_state.perception_latent)
+            phys_lat  = eco_out.get("domain_physics", agi_state.perception_latent)
+            align_val = self.align_loss(phys_lat, agi_state.language_latent)
+            align_val = align_val * self.curriculum.cfg.align_loss_weight
+            if align_val.requires_grad:
+                task_losses.append(align_val)
+                stats["align_loss"] = float(align_val.detach().item())
+
+        if not task_losses:
+            return {"loss": 0.0, **stats}
+
+        # ── PCGrad or plain joint backward ────────────────────────────────────
+        if self.curriculum.cfg.pcgrad_enabled and len(task_losses) > 1:
+            # PCGrad handles its own zero_grad + backward + step internally
+            self.pcgrad.zero_grad()
+            self.pcgrad.step(task_losses, retain_graph=False)
+
+            # Also step psyche, world model (with standard backward already done)
+            for opt in [self.opt_world, self.opt_psyche, self.opt_balance, self.opt_align]:
+                opt.zero_grad()
+                if task_losses:
+                    # Partial update: reuse already-computed gradients if available
+                    opt.step()
+
+        else:
+            # Fallback: weighted sum (standard backward)
+            self._zero_all()
+            total = sum(task_losses)
+            self.scaler.scale(total).backward()
+            active_opts = [
+                self.opt_world, self.opt_policy, self.opt_psyche,
+                self.opt_balance, self.opt_align,
+            ]
+            if self.opt_language:
+                active_opts.append(self.opt_language)
+            for opt in active_opts:
+                self.scaler.unscale_(opt)
+            self._clip_and_step(active_opts)
+            self.scaler.update()
+
+        # PPO buffer update
+        if agi_state.workspace_state is not None and reward is not None:
+            ws = agi_state.workspace_state.detach()
+            self.model.ppo.buffer.obs.append(ws)
+            if agi_state.planned_action is not None:
+                self.model.ppo.buffer.actions.append(agi_state.planned_action.detach())
+            self.model.ppo.buffer.rewards.append(float(reward.item()))
+            self.model.ppo.buffer.values.append(
+                float(self.model.critic_net(ws).detach().item())
+            )
+            act_logits = self.model.actor_net(ws)
+            lp = F.log_softmax(act_logits, dim=-1)
+            self.model.ppo.buffer.log_probs.append(lp.max().detach())
+            self.model.ppo.buffer.dones.append(done)
+            if len(self.model.ppo.buffer) >= 128:
+                self.model.ppo.update()
+
+        total_loss_val = sum(
+            float(l.detach().item()) for l in task_losses
+        )
+        stats["loss"] = total_loss_val
+        return stats
+
+    # ── Main training step ────────────────────────────────────────────────────
+
+    def step(
+        self,
+        observation: Dict[str, Optional[torch.Tensor]],
+        reward     : Optional[torch.Tensor] = None,
+        done       : bool = False,
+    ) -> Dict[str, float]:
+        """
+        Single unified training step.  Curriculum phase is determined
+        automatically; appropriate optimizer subset is activated.
+        """
+        # Determine current phase
+        phase = self.curriculum.on_step(
+            self._global_step,
+            {k: v[-1] for k, v in self.train_stats.items() if v},
+        )
+
+        # Step LR schedulers
+        for sched in self._schedulers:
+            sched.step()
+
+        self._global_step += 1
+
+        if phase == TrainingPhase.FOUNDATION:
+            stats = self._step_phase1(observation, reward)
+        elif phase == TrainingPhase.ALIGNMENT:
+            stats = self._step_phase2(observation, reward)
+        else:  # COGNITIVE
+            stats = self._step_phase3(observation, reward, done)
+
+        # Record stats
+        self.train_stats["total_loss"].append(stats.get("loss", 0.0))
+        self.train_stats["phase"].append(float(stats.get("phase", 0)))
+        if "align_loss" in stats:
+            self.train_stats["align_loss"].append(stats["align_loss"])
+
+        stats["global_step"] = self._global_step
+        stats["phase_name"]  = self.curriculum.phase_name()
+        stats["lr_world"]    = self._schedulers[0].get_last_lr()[0]
+
+        return stats
+
+    # ── Full training loop ────────────────────────────────────────────────────
+
+    def train(
+        self,
+        observations: List[Dict],
+        rewards     : Optional[List]  = None,
+        n_steps     : int             = 15_000,
+        eval_every  : int             = 200,
+    ) -> None:
+        """
+        Full curriculum training loop.
+
+        Default schedule (overridable via CurriculumConfig):
+          Steps   0 – 4 999  : Phase 1 FOUNDATION
+          Steps 5 000 – 9 999  : Phase 2 ALIGNMENT
+          Steps 10 000+        : Phase 3 COGNITIVE (PCGrad)
+        """
+        logger.info(
+            f"AGITrainerV3: starting {n_steps} steps  |  "
+            f"Phase1={self.curriculum.cfg.phase1_steps}  "
+            f"Phase2={self.curriculum.cfg.phase2_steps}  "
+            f"Phase3={'∞' if self.curriculum.cfg.phase3_steps < 0 else self.curriculum.cfg.phase3_steps}"
+        )
+
+        for step in range(n_steps):
+            idx  = step % len(observations)
+            obs  = observations[idx]
+            rwd  = torch.tensor(float(rewards[idx])).to(self.device) if rewards else None
+            stats = self.step(obs, rwd)
+
+            if step % eval_every == 0:
+                logger.info(
+                    f"Step {step:6d} [{stats['phase_name']:10s}]  "
+                    f"loss={stats.get('loss', 0):.4f}  "
+                    f"align={stats.get('align_loss', 0):.4f}  "
+                    f"psy={stats.get('psy_loss', 0):.4f}  "
+                    f"lr={stats.get('lr_world', 0):.2e}"
+                )
+
+        logger.info("AGITrainerV3: training complete.")
+
+    # ── Checkpoint I/O ────────────────────────────────────────────────────────
+
+    def save_checkpoint(self, path: str) -> None:
+        domain_opt_states = {
+            k: v.state_dict() for k, v in self._domain_opts.items()
+        }
+        torch.save({
+            "model_state"       : self.model.state_dict(),
+            "align_loss_state"  : self.align_loss.state_dict(),
+            "opt_world"         : self.opt_world.state_dict(),
+            "opt_policy"        : self.opt_policy.state_dict(),
+            "opt_psyche"        : self.opt_psyche.state_dict(),
+            "opt_balance"       : self.opt_balance.state_dict(),
+            "opt_align"         : self.opt_align.state_dict(),
+            "opt_language"      : self.opt_language.state_dict() if self.opt_language else None,
+            "domain_opts"       : domain_opt_states,
+            "curriculum_phase"  : self.curriculum.current_phase.value,
+            "global_step"       : self._global_step,
+            "train_stats"       : self.train_stats,
+            "agi_version"       : AGI_ONE_VERSION,
+        }, path)
+        logger.info(
+            f"AGITrainerV3 checkpoint saved: {path}  "
+            f"(step={self._global_step}  phase={self.curriculum.phase_name()})"
+        )
+
+    def load_checkpoint(self, path: str) -> None:
+        ckpt = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(ckpt["model_state"])
+        self.align_loss.load_state_dict(ckpt["align_loss_state"])
+        self.opt_world.load_state_dict(ckpt["opt_world"])
+        self.opt_policy.load_state_dict(ckpt["opt_policy"])
+        self.opt_psyche.load_state_dict(ckpt["opt_psyche"])
+        self.opt_balance.load_state_dict(ckpt["opt_balance"])
+        self.opt_align.load_state_dict(ckpt["opt_align"])
+        if self.opt_language and ckpt.get("opt_language"):
+            self.opt_language.load_state_dict(ckpt["opt_language"])
+        for domain, sd in ckpt.get("domain_opts", {}).items():
+            if domain in self._domain_opts:
+                self._domain_opts[domain].load_state_dict(sd)
+
+        # Restore curriculum phase
+        saved_phase = ckpt.get("curriculum_phase", 1)
+        if saved_phase >= 2:
+            self.curriculum._enter_phase(TrainingPhase(saved_phase))
+
+        self._global_step = ckpt.get("global_step", 0)
+        self.train_stats  = ckpt.get("train_stats", self.train_stats)
+        logger.info(
+            f"AGITrainerV3 checkpoint loaded: {path}  "
+            f"(step={self._global_step}  phase={self.curriculum.phase_name()})"
+        )
+
+    def print_training_config(self) -> None:
+        """Print a summary of the v3 training configuration."""
+        print(f"\n{'='*65}")
+        print(f"  AGI ONE v{AGI_ONE_VERSION} — AGITrainerV3 Configuration")
+        print(f"{'='*65}")
+        print(f"  Curriculum phases:")
+        print(f"    Phase 1 FOUNDATION : {self.curriculum.cfg.phase1_steps:,} steps")
+        print(f"    Phase 2 ALIGNMENT  : {self.curriculum.cfg.phase2_steps:,} steps")
+        phase3 = (
+            "∞" if self.curriculum.cfg.phase3_steps < 0
+            else f"{self.curriculum.cfg.phase3_steps:,}"
+        )
+        print(f"    Phase 3 COGNITIVE  : {phase3} steps")
+        print(f"  PCGrad enabled     : {self.curriculum.cfg.pcgrad_enabled}")
+        print(f"  Align loss weight  : {self.curriculum.cfg.align_loss_weight}")
+        print(f"  InfoNCE temperature: {math.exp(self.align_loss.log_tau.item()):.4f}")
+        print(f"  Decoupled optimizers:")
+        print(f"    world_model  lr : {self.opt_world.param_groups[0]['lr']:.1e}")
+        print(f"    policy_heads lr : {self.opt_policy.param_groups[0]['lr']:.1e}")
+        print(f"    psyche_layer lr : {self.opt_psyche.param_groups[0]['lr']:.1e}")
+        if self.opt_language:
+            print(f"    language_mod lr : {self.opt_language.param_groups[0]['lr']:.1e}")
+        print(f"    align_proj   lr : {self.opt_align.param_groups[0]['lr']:.1e}")
+        for dom, opt in self._domain_opts.items():
+            print(f"    [{dom:12s}] lr : {opt.param_groups[0]['lr']:.1e}")
+        print(f"  Ecosystem surrogates registered:")
+        for name in self.orchestrator.registered_names():
+            adp = self.orchestrator._adapters[name]
+            print(
+                f"    {name:35s} domain={adp.domain:12s} "
+                f"frozen={adp.frozen_backbone}"
+            )
+        print(f"{'='*65}\n")
+
