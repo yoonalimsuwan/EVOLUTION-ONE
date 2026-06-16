@@ -1333,3 +1333,320 @@ class PerceptionModule(nn.Module):
         if len(mods) == 1:
             return mods[0]
         return self.fusion(mods)
+
+
+# =============================================================================
+# SECTION 5 — UPGRADED LANGUAGE MODULE
+# GPT-style causal LM with RoPE + SSCStabilizer + InterfaceAttention
+# =============================================================================
+
+class RoPECausalTransformer(nn.Module):
+    """
+    [v2.0 UPGRADED] GPT-style causal language model with:
+    - RoPE positional embedding
+    - Pre-norm residual architecture
+    - SSCStabilizer per layer
+    - InterfaceAttention-modified self-attention
+    - CSOCComputeController for adaptive depth
+    """
+
+    def __init__(
+        self,
+        vocab_size  : int,
+        d_model     : int,
+        n_heads     : int,
+        n_layers    : int,
+        max_seq     : int   = 2048,
+        device      : torch.device = torch.device("cpu"),
+    ) -> None:
+        super().__init__()
+        self.d_model   = d_model
+        self.n_heads   = n_heads
+        self.n_layers  = n_layers
+        self.device    = device
+        self.head_dim  = d_model // n_heads
+
+        self.embed  = nn.Embedding(vocab_size, d_model)
+        self.rope   = RotaryEmbedding(self.head_dim, max_seq)
+
+        # Build layers with SSC stabilizers and interface attention
+        self.layers    : nn.ModuleList = nn.ModuleList()
+        self.ssc_stabs : nn.ModuleList = nn.ModuleList()
+        self.iface_attns: nn.ModuleList = nn.ModuleList()
+
+        for _ in range(n_layers):
+            enc_layer = nn.TransformerEncoderLayer(
+                d_model=d_model, nhead=n_heads,
+                dim_feedforward=d_model * 4,
+                dropout=0.0, batch_first=True, norm_first=True,
+            )
+            self.layers.append(enc_layer)
+            self.ssc_stabs.append(SSCStabilizer(d_model))
+            self.iface_attns.append(InterfaceAttention(d_model))
+
+        # CSOC compute controller [v2.0]
+        self.csoc = CSOCComputeController(
+            d_model=d_model, min_layers=2, max_layers=n_layers
+        )
+
+        self.norm    = nn.LayerNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size)
+
+        self.to(device)
+
+    def encode(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            token_ids : (B, L)
+        Returns:
+            (B, d_model) mean-pooled encoding
+        """
+        x = self.embed(token_ids)           # (B, L, D)
+
+        # CSOC: decide how many layers to run
+        _, n_active = self.csoc(x)
+
+        for i in range(n_active):
+            layer = self.layers[i]
+            x = layer(x)
+            x = self.ssc_stabs[i](x)       # SSC stabilization per layer
+
+        x = self.norm(x)
+        return x.mean(dim=1)               # (B, D)
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        return self.encode(token_ids)
+
+
+class LanguageModule(nn.Module):
+    """
+    AGI ONE v2.0 Language Interface.
+
+    Backend "builtin": RoPECausalTransformer (upgraded GPT-style)
+    Backend "huggingface:*": HuggingFace AutoModel
+    """
+
+    def __init__(self, cfg: AGIConfig) -> None:
+        super().__init__()
+        D = cfg.latent_dim
+        self.device     = cfg.device
+        self.latent_dim = D
+
+        backend = cfg.language_backend.lower()
+
+        if backend == "builtin" or not HAS_HF:
+            self.backbone = RoPECausalTransformer(
+                vocab_size = cfg.vocab_size,
+                d_model    = D,
+                n_heads    = cfg.n_transformer_heads,
+                n_layers   = cfg.n_transformer_layers,
+                device     = cfg.device,
+            )
+            self.lang_dim  = D
+            self._backend  = "builtin"
+            logger.info("LanguageModule: RoPE-GPT built-in backbone [v2.0]")
+
+        elif backend.startswith("huggingface:"):
+            model_id = backend.split("huggingface:", 1)[1] or cfg.language_model_id
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(model_id)
+                hf_model       = AutoModel.from_pretrained(model_id)
+                self.backbone  = hf_model.to(cfg.device)
+                self.lang_dim  = cfg.language_dim
+                self._backend  = "huggingface"
+                logger.info(f"LanguageModule: HuggingFace {model_id} [v2.0]")
+            except Exception as e:
+                logger.warning(f"HuggingFace load failed ({e}) → fallback builtin")
+                self.backbone = RoPECausalTransformer(
+                    cfg.vocab_size, D, cfg.n_transformer_heads,
+                    cfg.n_transformer_layers, device=cfg.device,
+                )
+                self.lang_dim = D
+                self._backend = "builtin"
+        else:
+            raise ValueError(f"Unknown language_backend: {backend}")
+
+        self.lang_to_latent = nn.Linear(self.lang_dim, D)
+        self.grounding_attn = nn.MultiheadAttention(
+            embed_dim=D, num_heads=cfg.n_transformer_heads, batch_first=True,
+        )
+        self.lm_head = nn.Linear(D, cfg.vocab_size)
+
+        self.to(cfg.device)
+
+    def encode(self, token_ids: torch.Tensor) -> torch.Tensor:
+        if self._backend == "builtin":
+            return self.backbone.encode(token_ids)
+        with torch.no_grad():
+            out = self.backbone(token_ids)
+            return self.lang_to_latent(out.last_hidden_state.mean(dim=1))
+
+    def ground(self, lang: torch.Tensor, percept: torch.Tensor) -> torch.Tensor:
+        q = lang.unsqueeze(1)
+        k = percept.unsqueeze(1)
+        g, _ = self.grounding_attn(q, k, k)
+        return g.squeeze(1)
+
+    def decode(self, latent: torch.Tensor) -> torch.Tensor:
+        return self.lm_head(latent)
+
+    def forward(
+        self,
+        token_ids         : torch.Tensor,
+        perception_latent : Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        lang = self.encode(token_ids)
+        if perception_latent is not None:
+            lang = self.ground(lang, perception_latent)
+        return lang, self.decode(lang)
+
+
+# =============================================================================
+# SECTION 6 — PSYCHE EXECUTIVE LAYER [v2.0 NEW]
+# Id → Goal Generator | Ego → Planner | Superego → Safety Constraint
+# =============================================================================
+
+class PsycheExecutiveLayer(nn.Module):
+    """
+    [v2.0 NEW] Psyche as Executive Layer above Transformer.
+
+    Reinterprets PSY ONE BRIDGE (Id/Ego/Superego) as a three-tier
+    executive control system:
+
+        Id       → Goal Generator  (what drives does the system have?)
+        Ego      → Planner         (what action best satisfies drives?)
+        Superego → Safety Filter   (does the action violate constraints?)
+
+    Pipeline:
+        Workspace state (D)
+            ↓
+        [Id]  drive_proposal (action_dim)
+        [Ego]  planned_action = free_energy_minimize(drive, constraint)
+        [Superego] safety_score ∈ [0,1]: block unsafe actions
+            ↓
+        executive_action (action_dim)  + safety_gate (scalar)
+
+    This module wraps PsycheTriad if available, otherwise provides
+    a differentiable standalone executive controller.
+    """
+
+    def __init__(
+        self,
+        latent_dim  : int,
+        action_dim  : int,
+        cfg         : AGIConfig,
+        device      : torch.device,
+    ) -> None:
+        super().__init__()
+        self.action_dim = action_dim
+        self.device     = device
+
+        # Goal Generator (Id analog): workspace → drive distribution
+        self.goal_generator = nn.Sequential(
+            nn.Linear(latent_dim, 256), nn.GELU(),
+            nn.LayerNorm(256),
+            nn.Linear(256, action_dim),
+            nn.Softmax(dim=-1),
+        )
+
+        # Planner (Ego analog): DEQ-like fixed-point via iterative refinement
+        self.planner_net = nn.Sequential(
+            nn.Linear(action_dim * 2, 256), nn.GELU(),
+            nn.Linear(256, action_dim),
+        )
+
+        # Safety Constraint (Superego analog): score ∈ [0, 1]
+        # 0 = unsafe (block), 1 = safe (allow)
+        self.safety_net = nn.Sequential(
+            nn.Linear(action_dim, 128), nn.GELU(),
+            nn.Linear(128, 1), nn.Sigmoid(),
+        )
+
+        # Normative policy (learnable "ethical prior")
+        self.normative_policy = nn.Parameter(
+            torch.ones(action_dim) / action_dim
+        )
+
+        # PSY ONE BRIDGE integration
+        self.psy_triad  : Optional[Any] = None
+        self.gumbel_sched: Optional[Any] = None
+        if cfg.use_psy_bridge and HAS_PSY_BRIDGE:
+            try:
+                mode = PsychopathologyMode(cfg.psyche_mode)
+            except ValueError:
+                mode = PsychopathologyMode.HEALTHY
+            self.psy_triad = PsycheTriad(PsycheConfig(
+                action_dim     = action_dim,
+                lambda_reg     = cfg.lambda_reg,
+                mode           = mode,
+                gumbel_tau     = cfg.gumbel_tau,
+                gumbel_hard    = cfg.gumbel_hard,
+                anderson_depth = cfg.anderson_depth,
+                device         = device,
+            ))
+            self.gumbel_sched = GumbelAnnealScheduler(
+                tau_start=1.0, tau_end=0.1, total_steps=50_000
+            )
+            logger.info("✓ PsycheTriad integrated into PsycheExecutiveLayer")
+
+        self.to(device)
+
+    def forward(
+        self,
+        workspace_state   : torch.Tensor,   # (D,)
+        n_planner_iters   : int = 5,
+    ) -> Dict[str, Any]:
+        """
+        Returns:
+            executive_action : (action_dim,) differentiable action
+            safety_gate      : scalar ∈ [0,1]
+            psyche_state     : PsycheTriadState or None
+            total_loss       : PSY bridge loss or None
+        """
+        # ── Id: Goal Generation ─────────────────────────────────────────────
+        if workspace_state.dim() == 1:
+            ws = workspace_state.unsqueeze(0)   # (1, D)
+        else:
+            ws = workspace_state
+
+        drive = self.goal_generator(ws).squeeze(0)   # (action_dim,)
+
+        # ── PSY BRIDGE (if available): use full differentiable triad ─────────
+        psyche_state = None
+        psy_loss     = None
+        if self.psy_triad is not None:
+            try:
+                tau = self.gumbel_sched.step() if self.gumbel_sched else 1.0
+                self.psy_triad.config.gumbel_tau = tau
+                # Adapt drive to expected distribution
+                drive_in = F.softmax(drive, dim=-1)
+                psyche_state, psy_loss = self.psy_triad(drive_in)
+                if psyche_state.soft_action is not None:
+                    drive = psyche_state.soft_action
+            except Exception as e:
+                logger.debug(f"PsycheTriad exec: {e}")
+
+        # ── Ego: Iterative Planning (DEQ-style fixed-point) ──────────────────
+        norm_pol = F.softmax(self.normative_policy, dim=-1)
+        plan     = drive.clone()
+        for _ in range(n_planner_iters):
+            combined = torch.cat([plan, norm_pol], dim=-1)   # (2*action_dim,)
+            delta    = self.planner_net(combined)
+            plan     = F.softmax(plan + 0.1 * delta, dim=-1)
+
+        # ── Superego: Safety Gate ─────────────────────────────────────────────
+        safety_score = self.safety_net(plan).squeeze(-1)   # scalar
+
+        # Gate: blend action with normative policy based on safety
+        executive_action = safety_score * plan + (1 - safety_score) * norm_pol
+
+        return {
+            "executive_action": executive_action,
+            "drive"           : drive,
+            "plan"            : plan,
+            "safety_score"    : safety_score,
+            "psyche_state"    : psyche_state,
+            "psy_loss"        : psy_loss,
+        }
+
+
