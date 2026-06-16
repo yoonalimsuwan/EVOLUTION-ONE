@@ -116,7 +116,7 @@ Quick Start
 
 ```bash
 # Basic analysis from a TCGA MAF file with duon BED and reference genome
-python evolution_one_v3.py \
+python evolution_one_v4.py \
     --input tcga_lung.maf \
     --genes EGFR KRAS TP53 \
     --duon_bed duons.bed \
@@ -125,13 +125,13 @@ python evolution_one_v3.py \
     --plot
 
 # Use VCF input and skip future mutation scanning
-python evolution_one_v3.py \
+python evolution_one_v4.py \
     --input patient.vcf --format vcf \
     --genes BRAF PIK3CA \
     --no_future
 
 # Train SOC thresholds from clinical labels (Optuna) and generate CRISPR designs
-python evolution_one_v3.py \
+python evolution_one_v4.py \
     --input tcga_colon.maf \
     --genes APC CTNNB1 SMAD4 \
     --clinical_labels_file labels.csv \
@@ -141,7 +141,7 @@ python evolution_one_v3.py \
     --output_dir ./colon_results
 
 # Resume a previous run from checkpoint
-python evolution_one_v3.py \
+python evolution_one_v4.py \
     --input tcga_luad.maf \
     --genes EGFR KRAS \
     --resume ./evo_output/checkpoint.pkl
