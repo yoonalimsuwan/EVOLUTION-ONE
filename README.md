@@ -9,7 +9,7 @@
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20007526-blue)](https://doi.org/10.5281/zenodo.20007526)
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.19814975-blue)](https://doi.org/10.5281/zenodo.19814975)
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20194882-blue)](https://doi.org/10.5281/zenodo.20194882)
-[![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20608513-blue)](https://doi.org/10.5281/zenodo.20608513)
+[![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20723152-blue)](https://doi.org/10.5281/zenodo.20723152)
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20451155-blue)](https://doi.org/10.5281/zenodo.20451155)
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20453128-blue)](https://doi.org/10.5281/zenodo.20453128)
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20633681-blue)](https://doi.org/10.5281/zenodo.20633681)
@@ -324,7 +324,7 @@ If you use this software, please cite:
 `
 Yoon A Limsuwan. "Evolution ONE: Multi‑Level Cancer Evolution & Structural Impact Engine And Epidemiology."
 Zenodo, 2026.
-https://doi.org/10.5281/zenodo.20608513
+https://doi.org/10.5281/zenodo.20723152
 ```
 
 ---
