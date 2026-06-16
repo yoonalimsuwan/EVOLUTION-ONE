@@ -1650,3 +1650,436 @@ class PsycheExecutiveLayer(nn.Module):
         }
 
 
+
+# =============================================================================
+# SECTION 7 — DREAMERV3-STYLE WORLD MODEL [v2.0 NEW]
+# Hafner et al. 2023: symlog, two-hot reward, free-bits KL,
+# categorical straight-through latents
+# =============================================================================
+
+def symlog(x: torch.Tensor) -> torch.Tensor:
+    """DreamerV3 symlog: sign(x) · log(|x| + 1)."""
+    return x.sign() * (x.abs() + 1.0).log()
+
+def symexp(x: torch.Tensor) -> torch.Tensor:
+    """DreamerV3 symexp: inverse of symlog."""
+    return x.sign() * (x.abs().exp() - 1.0)
+
+def two_hot_encode(x: torch.Tensor, n_bins: int = 255,
+                    lo: float = -20.0, hi: float = 20.0) -> torch.Tensor:
+    """
+    DreamerV3 two-hot encoding for reward.
+    Projects scalar reward onto two adjacent bins with linear interpolation.
+    """
+    bins  = torch.linspace(lo, hi, n_bins, device=x.device)
+    x_sym = symlog(x).clamp(lo, hi)
+    idx   = torch.bucketize(x_sym, bins) - 1
+    idx   = idx.clamp(0, n_bins - 2)
+
+    lo_val = bins[idx]
+    hi_val = bins[idx + 1]
+    w_hi   = ((x_sym - lo_val) / (hi_val - lo_val + 1e-8)).clamp(0, 1)
+    w_lo   = 1.0 - w_hi
+
+    target = torch.zeros(*x.shape, n_bins, device=x.device)
+    target.scatter_(-1, idx.unsqueeze(-1), w_lo.unsqueeze(-1))
+    target.scatter_(-1, (idx + 1).unsqueeze(-1), w_hi.unsqueeze(-1))
+    return target
+
+
+class DreamerV3WorldModel(nn.Module):
+    """
+    [v2.0 NEW] DreamerV3-style Recurrent State Space Model.
+
+    Key differences from RSSM v1.0:
+    [1] Categorical straight-through latents (32 classes × 32 variables)
+        instead of Gaussian — avoids posterior collapse
+    [2] symlog preprocessing on all inputs and reconstruction targets
+    [3] Two-hot encoding for reward (handles wide reward distributions)
+    [4] Free-bits KL: KL = max(free_bits, KL_per_variable)
+        prevents first few training steps from collapsing
+    [5] KL balancing: 80% from posterior, 20% from prior (DreamerV3 default)
+
+    References:
+        Hafner et al. "Mastering Diverse Domains with World Models" (2023)
+        https://arxiv.org/abs/2301.04104
+    """
+
+    def __init__(
+        self,
+        obs_dim        : int,
+        action_dim     : int,
+        stoch_size     : int   = 32,   # number of categorical variables
+        stoch_classes  : int   = 32,   # classes per variable
+        det_size       : int   = 512,
+        reward_bins    : int   = 255,
+        free_bits      : float = 1.0,
+        kl_balance     : float = 0.8,
+        device         : torch.device = torch.device("cpu"),
+    ) -> None:
+        super().__init__()
+        self.obs_dim       = obs_dim
+        self.action_dim    = action_dim
+        self.stoch_size    = stoch_size
+        self.stoch_classes = stoch_classes
+        self.det_size      = det_size
+        self.reward_bins   = reward_bins
+        self.free_bits     = free_bits
+        self.kl_balance    = kl_balance
+        self.device        = device
+
+        self.latent_dim    = stoch_size * stoch_classes
+
+        # ── Sequence model: GRU (deterministic state) ────────────────────────
+        self.gru = nn.GRUCell(
+            input_size  = self.latent_dim + action_dim,
+            hidden_size = det_size,
+        )
+
+        # ── Dynamics predictor: prior p(z_t | h_t) ───────────────────────────
+        self.prior_net = nn.Sequential(
+            nn.Linear(det_size, 512), nn.ELU(),
+            nn.Linear(512, stoch_size * stoch_classes),
+        )
+
+        # ── Representation model: posterior q(z_t | h_t, o_t) ───────────────
+        self.posterior_net = nn.Sequential(
+            nn.Linear(det_size + obs_dim, 512), nn.ELU(),
+            nn.Linear(512, stoch_size * stoch_classes),
+        )
+
+        # ── Decoder: observation reconstruction ─────────────────────────────
+        self.obs_decoder = nn.Sequential(
+            nn.Linear(det_size + self.latent_dim, 512), nn.ELU(),
+            nn.Linear(512, obs_dim),
+        )
+
+        # ── Reward predictor: two-hot output ──────────────────────────────────
+        self.reward_net = nn.Sequential(
+            nn.Linear(det_size + self.latent_dim, 256), nn.ELU(),
+            nn.Linear(256, reward_bins),
+        )
+
+        # ── Continue predictor: p(non-terminal) ───────────────────────────────
+        self.continue_net = nn.Sequential(
+            nn.Linear(det_size + self.latent_dim, 128), nn.ELU(),
+            nn.Linear(128, 1), nn.Sigmoid(),
+        )
+
+        # ── SSC stabilizer on hidden state ────────────────────────────────────
+        self.h_ssc = SSCStabilizer(det_size)
+
+        # ── Initial states ────────────────────────────────────────────────────
+        self.register_buffer("h0",  torch.zeros(1, det_size))
+        self.register_buffer("z0",  torch.zeros(1, self.latent_dim))
+
+        self.to(device)
+
+    # ── Categorical straight-through ─────────────────────────────────────────
+    def _straight_through_sample(
+        self, logits: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Straight-through estimator for categorical latents.
+        Returns (one_hot, soft_probs) — gradients flow through soft_probs.
+        """
+        B       = logits.shape[0]
+        logits_ = logits.view(B, self.stoch_size, self.stoch_classes)
+        probs   = F.softmax(logits_, dim=-1)
+        indices = probs.argmax(dim=-1)
+        one_hot = F.one_hot(indices, self.stoch_classes).float()
+        # Straight-through: forward = one_hot, backward = probs
+        z       = (one_hot - probs).detach() + probs
+        return z.view(B, self.latent_dim), probs
+
+    # ── Prior ─────────────────────────────────────────────────────────────────
+    def prior(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns (z_prior, prior_logits)."""
+        logits = self.prior_net(h)
+        z, _   = self._straight_through_sample(logits)
+        return z, logits
+
+    # ── Posterior ─────────────────────────────────────────────────────────────
+    def posterior(
+        self, h: torch.Tensor, obs: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns (z_post, posterior_logits)."""
+        obs_sym = symlog(obs)
+        inp     = torch.cat([h, obs_sym], dim=-1)
+        logits  = self.posterior_net(inp)
+        z, _    = self._straight_through_sample(logits)
+        return z, logits
+
+    # ── GRU transition ────────────────────────────────────────────────────────
+    def gru_step(
+        self, h: torch.Tensor, z: torch.Tensor, a: torch.Tensor
+    ) -> torch.Tensor:
+        inp    = torch.cat([z, a], dim=-1)
+        h_next = self.gru(inp, h)
+        return h_next
+
+    # ── Free-bits KL loss ─────────────────────────────────────────────────────
+    def kl_loss(
+        self,
+        post_logits : torch.Tensor,   # (B, stoch_size * stoch_classes)
+        prior_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        DreamerV3 free-bits KL with KL balancing.
+
+        KL = kl_balance * KL(post||sg(prior)) + (1-kl_balance) * KL(sg(post)||prior)
+        Free-bits: clamp KL per variable at free_bits minimum.
+        """
+        B = post_logits.shape[0]
+        post  = post_logits.view(B, self.stoch_size, self.stoch_classes)
+        prior = prior_logits.view(B, self.stoch_size, self.stoch_classes)
+
+        post_probs  = F.softmax(post,  dim=-1).clamp(1e-8)
+        prior_probs = F.softmax(prior, dim=-1).clamp(1e-8)
+
+        # KL(post || prior)
+        kl_pp = (post_probs * (post_probs.log() - prior_probs.log())).sum(-1)  # (B, S)
+        # KL(post_sg || prior)
+        kl_sp = ((post_probs.detach()) *
+                 (post_probs.detach().log() - prior_probs.log())).sum(-1)
+
+        # Free bits: max(free_bits, kl_per_variable)
+        kl_pp = kl_pp.clamp(min=self.free_bits)
+        kl_sp = kl_sp.clamp(min=self.free_bits)
+
+        loss = self.kl_balance * kl_pp + (1 - self.kl_balance) * kl_sp
+        return loss.mean()
+
+    # ── Reward loss ───────────────────────────────────────────────────────────
+    def reward_loss(
+        self, feat: torch.Tensor, reward: torch.Tensor
+    ) -> torch.Tensor:
+        logits = self.reward_net(feat)
+        target = two_hot_encode(
+            reward, self.reward_bins, device=reward.device
+        )
+        return -(target * F.log_softmax(logits, dim=-1)).sum(-1).mean()
+
+    # ── Imagine trajectory ────────────────────────────────────────────────────
+    def imagine(
+        self,
+        h0        : torch.Tensor,   # (1, det_size)
+        z0        : torch.Tensor,   # (1, latent_dim)
+        action_seq: torch.Tensor,   # (T, action_dim)
+    ) -> Dict[str, torch.Tensor]:
+        T     = action_seq.shape[0]
+        h, z  = h0, z0
+        h_seq, z_seq, r_seq, cont_seq = [], [], [], []
+
+        for t in range(T):
+            a     = action_seq[t].unsqueeze(0)
+            h     = self.gru_step(h, z, a)
+            z, _  = self.prior(h)
+            feat  = torch.cat([h, z], dim=-1)
+            r     = self.reward_net(feat)
+            cont  = self.continue_net(feat)
+            h_seq.append(h); z_seq.append(z)
+            r_seq.append(r); cont_seq.append(cont)
+
+        return {
+            "h_seq"     : torch.cat(h_seq,    dim=0),
+            "z_seq"     : torch.cat(z_seq,    dim=0),
+            "reward_seq": torch.cat(r_seq,    dim=0),
+            "cont_seq"  : torch.cat(cont_seq, dim=0),
+        }
+
+    def forward(
+        self,
+        h      : torch.Tensor,
+        z      : torch.Tensor,
+        action : torch.Tensor,
+        obs    : Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        h_next       = self.gru_step(h, z, action)
+
+        # Stabilize hidden state
+        h_stable     = self.h_ssc(h_next.unsqueeze(1)).squeeze(1)
+
+        prior_logits                  = self.prior_net(h_stable)
+        z_prior, _                    = self._straight_through_sample(prior_logits)
+
+        if obs is not None:
+            post_logits               = self.posterior_net(
+                torch.cat([h_stable, symlog(obs)], dim=-1)
+            )
+            z_post, _                 = self._straight_through_sample(post_logits)
+            z_next                    = z_post
+        else:
+            post_logits               = prior_logits
+            z_next                    = z_prior
+
+        feat         = torch.cat([h_stable, z_next], dim=-1)
+        obs_pred     = symexp(self.obs_decoder(feat))
+        reward_logits= self.reward_net(feat)
+        cont_pred    = self.continue_net(feat)
+
+        return {
+            "h_next"        : h_stable,
+            "z_next"        : z_next,
+            "obs_pred"      : obs_pred,
+            "reward_logits" : reward_logits,
+            "cont_pred"     : cont_pred,
+            "prior_logits"  : prior_logits,
+            "post_logits"   : post_logits,
+            "feat"          : feat,
+        }
+
+
+# =============================================================================
+# SECTION 8 — MPPI PLANNER [v2.0 REPLACES CEM]
+# Williams et al. 2017 — GPU-parallel importance-weighted planning
+# =============================================================================
+
+class MPPIPlanner(nn.Module):
+    """
+    [v2.0 NEW] Model Predictive Path Integral (MPPI) Planner.
+
+    Replaces CEM. Key advantages:
+    - All N trajectories evaluated in parallel (no sequential elite selection)
+    - Importance-weighted update: ALL samples contribute, not just top-k
+    - Smoother, more stable optimization landscape
+    - Better exploration via temperature-controlled weighting
+
+    Algorithm:
+        1. Sample N perturbations ε ~ N(0, σ²I) around nominal action sequence
+        2. Roll out each in world model → cost = -sum(discount^t * reward_t)
+        3. Compute importance weights: w_i = exp(-(cost_i - min_cost)/λ)
+        4. Update: μ_new = Σ(w_i * (μ + ε_i)) / Σw_i
+        5. Execute μ[0]; warm-start next step
+    """
+
+    def __init__(
+        self,
+        action_dim      : int,
+        horizon         : int,
+        n_samples       : int,
+        temperature     : float,
+        noise_sigma     : float,
+        device          : torch.device,
+    ) -> None:
+        super().__init__()
+        self.action_dim  = action_dim
+        self.horizon     = horizon
+        self.n_samples   = n_samples
+        self.temperature = temperature
+        self.noise_sigma = noise_sigma
+        self.device      = device
+
+        # Nominal action sequence (warm-started between steps)
+        self.register_buffer(
+            "mu", torch.zeros(horizon, action_dim)
+        )
+
+        # Value baseline for terminal bootstrap
+        self.value_net = nn.Sequential(
+            nn.Linear(512 + 32 * 32, 256), nn.ELU(),
+            nn.Linear(256, 1),
+        )
+
+        self.goal_encoder = nn.Linear(action_dim, action_dim)
+        self.to(device)
+
+    def plan(
+        self,
+        world_model   : DreamerV3WorldModel,
+        h             : torch.Tensor,         # (1, det_size)
+        z             : torch.Tensor,         # (1, latent_dim)
+        goal          : Optional[torch.Tensor] = None,
+        psyche_bias   : Optional[torch.Tensor] = None,
+        discount      : float = 0.99,
+        n_iters       : int   = 3,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        MPPI planning loop.
+
+        Returns:
+            best_action   : (action_dim,) first action to execute
+            best_sequence : (T, action_dim) full sequence
+        """
+        T  = self.horizon
+        mu = self.mu.clone()
+
+        # Add psyche drive bias to nominal sequence
+        if psyche_bias is not None:
+            bias = psyche_bias.to(self.device)
+            if bias.shape[-1] != self.action_dim:
+                bias = F.adaptive_avg_pool1d(
+                    bias.unsqueeze(0).unsqueeze(0), self.action_dim
+                ).squeeze()
+            mu += 0.1 * bias.unsqueeze(0).expand(T, -1)
+
+        for _ in range(n_iters):
+            # Sample perturbations: (N, T, action_dim)
+            eps     = torch.randn(
+                self.n_samples, T, self.action_dim, device=self.device
+            ) * self.noise_sigma
+            samples = mu.unsqueeze(0) + eps   # (N, T, A)
+
+            # Evaluate trajectories: compute costs
+            costs = torch.zeros(self.n_samples, device=self.device)
+            for i in range(self.n_samples):
+                traj = world_model.imagine(
+                    h0         = h,
+                    z0         = z,
+                    action_seq = samples[i],
+                )
+                # Cost = negative discounted reward
+                r_logits  = traj["reward_seq"]        # (T, reward_bins)
+                r_bins    = torch.linspace(-20, 20, world_model.reward_bins,
+                                           device=self.device)
+                r_pred    = (F.softmax(r_logits, dim=-1) * r_bins).sum(-1)
+                r_pred    = symexp(r_pred)
+                discounts = torch.tensor(
+                    [discount ** t for t in range(T)], device=self.device
+                )
+                # Continuation weighting
+                cont      = traj["cont_seq"].squeeze(-1)
+                cum_cont  = cont.cumprod(dim=0)
+                returns   = (r_pred * discounts * cum_cont).sum()
+
+                # Goal bonus
+                if goal is not None:
+                    final_z = traj["z_seq"][-1:]
+                    goal_enc = self.goal_encoder(goal)
+                    bonus    = F.cosine_similarity(
+                        final_z.mean(dim=-1, keepdim=True),
+                        goal_enc.unsqueeze(-1),
+                        dim=0,
+                    ).mean()
+                    returns += bonus
+
+                costs[i] = -returns   # negate: lower cost = better
+
+            # Importance weights: w_i = exp(-(cost_i - min_cost) / λ)
+            beta    = costs.min()
+            weights = torch.exp(-(costs - beta) / self.temperature)
+            weights = weights / (weights.sum() + 1e-8)     # normalize
+
+            # Weighted update of nominal sequence
+            mu      = (weights.view(-1, 1, 1) * samples).sum(dim=0)
+
+        # Warm-start: shift sequence left, repeat last action
+        self.mu[:-1] = mu[1:].detach()
+        self.mu[-1]  = mu[-1].detach()
+
+        return mu[0], mu
+
+    def reset(self) -> None:
+        """Reset warm-started nominal sequence (new episode)."""
+        self.mu.zero_()
+
+    def forward(
+        self,
+        world_model: DreamerV3WorldModel,
+        h          : torch.Tensor,
+        z          : torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        best_action, _ = self.plan(world_model, h, z, **kwargs)
+        return best_action
+
