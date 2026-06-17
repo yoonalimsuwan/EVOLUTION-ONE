@@ -98,6 +98,22 @@
 # external dependency). Training and inference never hard-fail because of
 # a missing optional module.
 #
+# Cost notes
+# ----------
+#   • Plain inference (forward(batch, mode=...)) — IDENTICAL cost to the
+#     base StructuralGNOEvolution; nothing about the architecture changed.
+#   • forward_certified() (inference) — one Mode-1 + one Mode-3 forward
+#     pass (no duplication) plus a cheap analytic bridge call.
+#   • SGNOEvolutionBVTrainer.train_step() — single-pass loss computation:
+#     each mode is forwarded through the model exactly ONCE per step, and
+#     the BV-1 / BV-2 terms are computed from those same outputs. There is
+#     no duplicated forward/backward cost versus the base trainer.
+#   • The exact BV engines themselves (BV-1's bridge call, BV-2, BV-3) are
+#     all cheap, fixed-size scalar/reduction operations — independent of
+#     graph or grid size — so they add no meaningful overhead on their own.
+#   • Zero new trainable parameters are introduced anywhere (see "Parameter
+#     count" below), so model capacity / memory footprint is unchanged too.
+#
 # Dependencies
 # ------------
 #   torch ≥ 2.1   (AMP, compile-ready)
@@ -1817,38 +1833,99 @@ class SGNOEvolutionBVTrainer(SGNOEvolutionTrainer):
         self.model: StructuralGNOEvolutionBV = model
 
     # ------------------------------------------------------------------
-    # BV-augmented loss computation
+    # BV-augmented loss computation — SINGLE forward pass per mode
     # ------------------------------------------------------------------
 
-    def _compute_bv_losses(
+    def _compute_losses(
         self,
         batch_evo: Optional[BatchData],
         batch_md:  Optional[BatchData],
         batch_ch:  Optional[BatchData],
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        Compute base multi-objective loss plus the BV-1 / BV-2 additions.
+        Single-pass override of ``SGNOEvolutionTrainer._compute_losses``.
 
-        Re-runs the relevant forward passes (kept separate from the base
-        trainer's private ``_compute_losses`` for clarity / composability
-        rather than raw speed — batches in this research setting are small
-        graphs, so the duplicate forward cost is negligible).
+        Computes the base multi-objective loss AND the BV-1 / BV-2
+        additions from the *same* forward-pass outputs — each mode is run
+        through ``self.model`` exactly once, regardless of how many loss
+        terms consume its output. This removes the duplicate-forward cost
+        of the original design (which called ``self.model(...)`` a second
+        time per mode purely to compute the BV terms).
+
+        Because this method has the same name as the base class's private
+        loss-computation method, both ``train_step`` and ``evaluate`` —
+        inherited unchanged from ``SGNOEvolutionTrainer`` — pick it up
+        automatically through ordinary Python method resolution. No other
+        method needs to change to get the BV terms wired in.
+
+        Maintenance note: the Mode-1/2/3 base-loss math below intentionally
+        mirrors ``SGNOEvolutionTrainer._compute_losses`` line-for-line. If
+        that method changes upstream, this override must be updated to
+        match — that coupling is the price paid for avoiding recomputation.
         """
-        total_loss, log = self._compute_losses(batch_evo, batch_md, batch_ch)
-        cfg = self.cfg
+        cfg        = self.cfg
+        total_loss = torch.tensor(0.0, device=self.device)
+        log: Dict[str, float] = {}
 
-        # ── BV-2 : mass conservation (always available) ────────────────
+        out_evo: Optional[Dict[str, torch.Tensor]] = None
+
+        # ── Mode 1: Evolution / Epidemiological ─────────────────────
+        if batch_evo is not None:
+            out_evo  = self.model(batch_evo, mode="evolution")
+            mu_rt    = out_evo["mu_rt"]
+            logits   = out_evo["logits"]
+
+            loss_mu_rt = loss_rt_kl_smooth(mu_rt, batch_evo.true_mu_rt)
+            loss_cls   = F.cross_entropy(logits, batch_evo.labels)
+
+            l_evo      = cfg.lambda_evo * loss_mu_rt + cfg.lambda_cls * loss_cls
+            total_loss = total_loss + l_evo
+            log["loss_mu_rt"] = loss_mu_rt.item()
+            log["loss_cls"]   = loss_cls.item()
+            log["loss_evo"]   = l_evo.item()
+
+        # ── Mode 2: Structural Langevin ──────────────────────────────
+        if batch_md is not None:
+            out_md      = self.model(batch_md, mode="langevin")
+            pred_coords = out_md["pred_coords"]
+            displ       = out_md["displacements"]
+
+            loss_md_mse  = F.mse_loss(pred_coords, batch_md.true_future_coords)
+            loss_md_phys = loss_energy_conservation(
+                displ, batch_md.coords, batch_md.edge_index
+            )
+
+            l_md       = cfg.lambda_md * loss_md_mse + cfg.lambda_md_phys * loss_md_phys
+            total_loss = total_loss + l_md
+            log["loss_md_mse"]  = loss_md_mse.item()
+            log["loss_md_phys"] = loss_md_phys.item()
+            log["loss_md"]      = l_md.item()
+
+        # ── Mode 3: Cahn-Hilliard 3D  (+ BV-2, + BV-1) ───────────────
         if batch_ch is not None:
-            out_ch      = self.model(batch_ch, mode="ch3d")
-            loss_bv_mass = loss_bv_mass_conservation(out_ch["delta_u"])
+            out_ch    = self.model(batch_ch, mode="ch3d")
+            pred_u    = out_ch["pred_u"]
+            delta_u   = out_ch["delta_u"]
+
+            loss_ch_mse = F.mse_loss(pred_u, batch_ch.true_future_u)
+            loss_ch_tv  = loss_total_variation_3d(delta_u)
+
+            l_ch       = cfg.lambda_ch * loss_ch_mse + cfg.lambda_ch_tv * loss_ch_tv
+            total_loss = total_loss + l_ch
+            log["loss_ch_mse"] = loss_ch_mse.item()
+            log["loss_ch_tv"]  = loss_ch_tv.item()
+            log["loss_ch"]     = l_ch.item()
+
+            # BV-2 : mass conservation — reuses delta_u, zero extra forward
+            loss_bv_mass = loss_bv_mass_conservation(delta_u)
             l_bv_mass    = cfg.lambda_bv_mass * loss_bv_mass
             total_loss   = total_loss + l_bv_mass
             log["loss_bv_mass"] = l_bv_mass.item()
 
-            # ── BV-1 : cross-modal distillation (requires bridge + Mode 1) ──
-            if batch_evo is not None and self.model.bv_bridge.available:
-                out_evo  = self.model(batch_evo, mode="evolution")
-                mu_boost = self.model.bv_bridge.mu_bv_and_boost(out_ch["pred_u"].detach())
+            # BV-1 : cross-modal distillation — reuses out_evo / pred_u,
+            # zero extra forward calls (requires bridge + Mode-1 batch).
+            if out_evo is not None and self.model.bv_bridge.available:
+                mu_boost = self.model.bv_bridge.mu_bv_and_boost(pred_u.detach())
                 if mu_boost is not None:
                     mu_bv, rt_boost = mu_boost
                     loss_distill = loss_bv_distillation(out_evo["mu_rt"], rt_boost)
@@ -1861,7 +1938,7 @@ class SGNOEvolutionBVTrainer(SGNOEvolutionTrainer):
         return total_loss, log
 
     # ------------------------------------------------------------------
-    # Single training step (BV-augmented)
+    # Single training step — delegates to the base class, adds BV-3 only
     # ------------------------------------------------------------------
 
     def train_step(
@@ -1871,48 +1948,23 @@ class SGNOEvolutionBVTrainer(SGNOEvolutionTrainer):
         batch_ch:  Optional[BatchData] = None,
     ) -> Dict[str, float]:
         """
-        Identical contract to ``SGNOEvolutionTrainer.train_step``, but the
-        loss includes BV-1 / BV-2 terms, and BV-3 certification runs
-        automatically every ``cfg.bv_cert_every`` steps when a Mode-1 batch
-        with an edge_index is available.
+        Identical contract to ``SGNOEvolutionTrainer.train_step``.
+
+        All AMP / gradient-clipping / NaN-guard / EMA / LR-scheduling
+        machinery is delegated to the base class unchanged via
+        ``super().train_step(...)`` — it transparently picks up this
+        class's single-pass ``_compute_losses`` override through normal
+        method resolution, so the BV-1 / BV-2 terms are included with no
+        duplicated logic here. Only the BV-3 periodic certification hook
+        is added, after the optimiser step.
         """
-        if batch_evo is None and batch_md is None and batch_ch is None:
-            raise ValueError("At least one batch must be non-None.")
+        log = super().train_step(batch_evo, batch_md, batch_ch)
 
-        self.model.train()
-        self.optimizer.zero_grad(set_to_none=True)
-
-        with torch.cuda.amp.autocast(enabled=self._use_amp):
-            total_loss, log = self._compute_bv_losses(batch_evo, batch_md, batch_ch)
-
-        if not torch.isfinite(total_loss):
-            logger.warning("Step %d: non-finite loss (%.4g) — skipping update.",
-                           self.global_step, total_loss.item())
-            return log
-
-        self._scaler.scale(total_loss).backward()
-        self._scaler.unscale_(self.optimizer)
-        grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
-
-        if not torch.isfinite(grad_norm):
-            logger.warning("Step %d: non-finite gradient norm — skipping update.", self.global_step)
-            self.optimizer.zero_grad(set_to_none=True)
-            return log
-
-        self._scaler.step(self.optimizer)
-        self._scaler.update()
-        self.scheduler.step()
-        self.ema.update(self.model)
-
-        log["grad_norm"] = grad_norm.item()
-        log["lr"]        = self.scheduler.get_last_lr()[0]
-        self.global_step += 1
-
-        # ── BV-3 : periodic analytic certification ─────────────────────
         if (
             self.cfg.bv_cert_every > 0
             and self.model.bv_bridge.available
             and batch_evo is not None
+            and self.global_step > 0
             and self.global_step % self.cfg.bv_cert_every == 0
         ):
             cert = self.model.bv_bridge.certify(
@@ -1922,11 +1974,8 @@ class SGNOEvolutionBVTrainer(SGNOEvolutionTrainer):
                 log["bv_cme_residual"]       = cert.cme_residual
                 log["bv_overall_consistent"] = float(cert.overall_consistent)
 
-        if self.global_step % self.cfg.log_every == 0:
-            loss_str = "  ".join(f"{k}={v:.4f}" for k, v in log.items())
-            logger.info("Step %6d | %s", self.global_step, loss_str)
-
         return log
+
 
 
 # =============================================================================
@@ -1991,7 +2040,23 @@ if __name__ == "__main__":
 
     trainer = SGNOEvolutionBVTrainer(model, cfg, device=device, ckpt_dir="/tmp/sgno_bv_test_ckpts")
 
-    # ── A few train steps (exercises BV-1 + BV-2, and BV-3 at step 2) ──
+    # ── Verify the single-pass optimisation: exactly 3 forward calls per
+    #    train_step (one per mode), not 5 (which the old duplicate-forward
+    #    design would have produced when BV-1 distillation is active) ──
+    _orig_forward  = model.forward
+    _forward_calls = {"n": 0}
+    def _counting_forward(*a, **kw):
+        _forward_calls["n"] += 1
+        return _orig_forward(*a, **kw)
+    model.forward = _counting_forward
+    _ = trainer.train_step(batch_evo, batch_md, batch_ch)
+    model.forward = _orig_forward
+    expected_calls = 3  # evolution + langevin + ch3d, each exactly once
+    print(f"  forward-call count per train_step = {_forward_calls['n']} "
+          f"(expected {expected_calls}) -> "
+          f"{'[PASS] single-pass confirmed' if _forward_calls['n'] == expected_calls else '[FAIL] duplicate forward detected'}")
+
+    # ── A few more train steps (exercises BV-1 + BV-2, and BV-3 at step 2) ──
     for i in range(3):
         log = trainer.train_step(batch_evo, batch_md, batch_ch)
     print(f"  train_step OK  total_loss={log['total_loss']:.4f}  "
