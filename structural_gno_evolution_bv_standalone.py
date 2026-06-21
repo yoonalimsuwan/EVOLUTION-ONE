@@ -20,7 +20,11 @@
 #                             loss, periodic analytic certification,
 #                             StructuralGNOEvolutionBV, SGNOEvolutionBVTrainer,
 #                             two-stage graceful ImportError fallback chain,
-#                             and this standalone single-file merge.
+#                             this standalone single-file merge, AND the
+#                             Mode-4 cell-population coupling layer:
+#                             CellPopulationTrainingBridge, CellPopulationRollout,
+#                             the division-rate-matching training loss, and
+#                             the third stage of the graceful fallback chain.
 #   - GPT      (OpenAI)     — early architecture exploration, message-passing
 #                             design, phase-field surrogate concept.
 #   - Gemini   (Google)     — v2 unified discrete/continuous extension,
@@ -34,8 +38,10 @@
 # SigmaEncoder, FiLMMessagePassing, the physics-informed losses, EMAWeights,
 # CheckpointManager, SGNOEvolutionTrainer — Sections 0-9 below) is included
 # verbatim in this single file, followed by the BV-edition layer (Sections
-# 10-16) that extends it. No import of a separate ``structural_gno_evolution``
-# module is required; this file is fully self-contained.
+# 10-16) that extends it, plus a Mode-4 cell-population coupling layer
+# (Section 14.5) composed on top of both. No import of a separate
+# ``structural_gno_evolution`` module is required; this file is fully
+# self-contained.
 #
 # StructuralGNOEvolutionBV is the BV-aware special edition of
 # StructuralGNOEvolution (SGNO-Evo). It keeps the entire production GNO
@@ -46,7 +52,8 @@
 # non-parametric BV gauge-theory engines already validated for the
 # EVOLUTION ONE cluster (GeneNetworkBVFull / InteractionNetworkBVFull /
 # CahnHilliardBVFull) — instead of duplicating that formalism inside the
-# neural surrogate.
+# neural surrogate. A fourth feature, Mode 4, composes similarly with
+# ``cell_population_one.py``'s agent-based ``CellPopulation``.
 #
 # Three concrete BV-edition features
 # -----------------------------------
@@ -78,23 +85,45 @@
 #       of the neural surrogate. Results ([PASS]/[FAIL]) are logged and
 #       returned in the training log dict as a free-standing certificate.
 #
+# One concrete Mode-4 feature
+# ----------------------------
+#   [POP-1] Cell-population division-rate matching (Mode 4)
+#       CellPopulation (cell_population_one.py) has zero trainable weights
+#       of its own — division/death are deterministic smooth functions of
+#       (a) the local Mode-3 phase field sampled at each cell's position via
+#       grid_sample, and (b) a per-genotype fitness buffer. "Training" it,
+#       therefore, means driving its rollout with the GNO's *predicted*
+#       phase field and pulling the *induced* mean division-rate trajectory
+#       toward a target via ``loss_population_rate_match`` — the gradient
+#       flows CellPopulation.step() -> grid_sample -> pred_u -> the GNO's
+#       ch3d_head, never into CellPopulation itself. Note this is NOT the
+#       same pathway as ``population_mutation_load()``, which — per its own
+#       docstring in cell_population_one.py — is differentiable only w.r.t.
+#       the (non-GNO-derived) genotype_fitness buffer; that quantity is
+#       logged as a diagnostic (``pop_mu_final``) but is never the loss term
+#       that actually moves the GNO's weights.
+#
 # Parameter count
 # ----------------
 # StructuralGNOEvolutionBV adds ZERO new trainable parameters relative to
-# StructuralGNOEvolution — the BV engines it composes with are purely
-# analytic (no nn.Parameter / nn.Module). model.num_parameters() and the
-# state_dict() keys are therefore identical between the two; a checkpoint
-# trained with either model loads directly into the other.
+# StructuralGNOEvolution — the BV engines and the CellPopulation it composes
+# with are purely analytic / parameter-free (no nn.Parameter contributed by
+# either bv_full_theory_one or cell_population_one). model.num_parameters()
+# and the state_dict() keys are therefore identical between the BV edition
+# and the plain base model; a checkpoint trained with either loads directly
+# into the other.
 #
-# Graceful degradation (still two-stage, even though single-file)
+# Graceful degradation (still three-stage, even though single-file)
 # -------------------------------------------------------------------
 #   this file
 #     -> bv_full_theory_one            (BV-1, BV-3; optional, separate file)
 #         -> one_core_evolution        (required by bv_full_theory_one)
+#     -> cell_population_one          (Mode 4 / POP-1; optional, separate file)
 #
-# If either link of that chain is missing, BV-1 and BV-3 disable themselves
-# automatically (with a single warning) and StructuralGNOEvolutionBV
-# degrades to the plain production GNO surrogate plus BV-2 (which has no
+# If any link of either chain is missing, the corresponding feature(s)
+# disable themselves automatically (with a single warning) and
+# StructuralGNOEvolutionBV degrades to whatever subset remains available —
+# at minimum the plain production GNO surrogate plus BV-2 (which has no
 # external dependency). Training and inference never hard-fail because of
 # a missing optional module.
 #
@@ -106,8 +135,11 @@
 #     pass (no duplication) plus a cheap analytic bridge call.
 #   • SGNOEvolutionBVTrainer.train_step() — single-pass loss computation:
 #     each mode is forwarded through the model exactly ONCE per step, and
-#     the BV-1 / BV-2 terms are computed from those same outputs. There is
-#     no duplicated forward/backward cost versus the base trainer.
+#     the BV-1 / BV-2 / Mode-4 terms are computed from those same outputs.
+#     There is no duplicated GNO forward/backward cost versus the base
+#     trainer; the Mode-4 CellPopulation rollout adds ``cellpop_rollout_steps``
+#     extra (cheap, CPU-resident, vectorised) population-update calls per
+#     Mode-3 batch, independent of GNO graph/grid size.
 #   • The exact BV engines themselves (BV-1's bridge call, BV-2, BV-3) are
 #     all cheap, fixed-size scalar/reduction operations — independent of
 #     graph or grid size — so they add no meaningful overhead on their own.
@@ -119,6 +151,7 @@
 #   torch ≥ 2.1   (AMP, compile-ready)
 #   bv_full_theory_one   (optional — separate file, enables BV-1 / BV-3)
 #   one_core_evolution   (optional — required transitively by the line above)
+#   cell_population_one  (optional — separate file, enables Mode 4 / POP-1)
 # =============================================================================
 
 from __future__ import annotations
@@ -1397,6 +1430,29 @@ except ImportError as _bv_import_err:
         _bv_import_err,
     )
 
+# ---------------------------------------------------------------------------
+# Stage 2 — Optional CELL POPULATION ONE cross-cluster integration (Mode 4)
+# ---------------------------------------------------------------------------
+try:
+    from cell_population_one import (
+        CellPopulation,
+        CellPopulationConfig,
+        CellPopulationCahnHilliardBridge,
+        CELL_POPULATION_VERSION,
+    )
+    _HAS_CELL_POPULATION = True
+    logger.info("structural_gno_evolution_bv: cell_population_one v%s loaded.", CELL_POPULATION_VERSION)
+except ImportError as _cellpop_import_err:
+    _HAS_CELL_POPULATION = False
+    CellPopulation = CellPopulationConfig = CellPopulationCahnHilliardBridge = None  # type: ignore
+    CELL_POPULATION_VERSION = "unavailable"
+    logger.debug(
+        "structural_gno_evolution_bv: cell_population_one not found (%s) — "
+        "Mode-4 cell-population training is disabled; Modes 1-3 and the "
+        "BV-1/2/3 features remain fully functional.",
+        _cellpop_import_err,
+    )
+
 __all__ += [
     "SGNOEvoBVConfig",
     "BVCertificationReport",
@@ -1406,9 +1462,14 @@ __all__ += [
     "StructuralGNOEvolutionBV",
     "SGNOEvolutionBVTrainer",
     "SGNO_BV_VERSION",
+    # Mode-4: Cell Population
+    "CellPopulationRollout",
+    "loss_population_clone_match",
+    "loss_population_rate_match",
+    "CellPopulationTrainingBridge",
 ]
 
-SGNO_BV_VERSION: str = "1.0.0"
+SGNO_BV_VERSION: str = "1.1.0"
 
 
 # =============================================================================
@@ -1446,6 +1507,41 @@ class SGNOEvoBVConfig(SGNOEvoConfig):
     bv_cert_max_nodes  : Cap on the number of graph nodes handed to the exact
                           BV engines per certification call (BVAntibracket is
                           O(n) backward passes per check — keep this small).
+
+    Cell population coupling (Mode 4; optional, separate file)
+    --------------------------------------------------------------
+    enable_cell_population : Master switch. If True but cell_population_one
+                          is not importable, Mode-4 training silently
+                          disables itself (with a single warning) and the
+                          model degrades to Modes 1-3 + BV-1/2/3 only.
+    cellpop_n_max       : Capacity (n_max) of the CellPopulation this model
+                          trains against. Must match cfg.grid_shape's voxel
+                          count only insofar as cell positions are sampled
+                          on the same (Nx,Ny,Nz) box the Mode-3 batch covers
+                          — n_max itself is independent of grid resolution.
+    cellpop_n_genotypes : Number of clone genotypes in the attached
+                          CellPopulation.
+    cellpop_rollout_steps : Number of CellPopulation.step() calls per
+                          training batch — i.e. how many population
+                          generations the GNO's predicted phase field is
+                          asked to drive before the population-level loss
+                          is evaluated. Kept small by default since each
+                          step is itself cheap but the rollout is sequential
+                          (not parallelisable across steps).
+    lambda_pop_clone    : Loss weight for the clone-frequency matching term
+                          (diagnostic-only — see ``loss_population_clone_match``).
+    lambda_pop_rate     : Loss weight for the division-rate matching term —
+                          Mode-4's actual trainable signal, see
+                          ``loss_population_rate_match``.
+    pop_target_division_rate : Target mean division-rate value the Mode-4
+                          rollout is pulled toward at every rollout step.
+                          A scalar default (0.05 = a stable, non-exploding/
+                          non-collapsing carrying-capacity rate); supply a
+                          real target derived from an observed cohort's
+                          growth-curve fit for an actual training signal
+                          rather than a synthetic anchor.
+    pop_cert_every      : Log a population-rollout diagnostic (n_alive,
+                          mutation load) every N optimiser steps (0 disables).
     """
 
     # BV bridge
@@ -1462,6 +1558,16 @@ class SGNOEvoBVConfig(SGNOEvoConfig):
     bv_cert_every:     int   = 100
     bv_cert_max_nodes: int   = 16
 
+    # Cell population coupling (Mode 4)
+    enable_cell_population:   bool  = True
+    cellpop_n_max:             int   = 512
+    cellpop_n_genotypes:       int   = 8
+    cellpop_rollout_steps:     int   = 4
+    lambda_pop_clone:          float = 0.0
+    lambda_pop_rate:           float = 0.1
+    pop_target_division_rate: float = 0.05
+    pop_cert_every:            int   = 100
+
     def __post_init__(self) -> None:
         super().__post_init__()
         assert self.bv_kappa          > 0,  "bv_kappa must be positive"
@@ -1469,6 +1575,14 @@ class SGNOEvoBVConfig(SGNOEvoConfig):
         assert self.lambda_bv_mass    >= 0, "lambda_bv_mass must be ≥ 0"
         assert self.bv_cert_every     >= 0, "bv_cert_every must be ≥ 0"
         assert self.bv_cert_max_nodes >= 3, "bv_cert_max_nodes must be ≥ 3"
+        assert self.cellpop_n_max       >= 1, "cellpop_n_max must be ≥ 1"
+        assert self.cellpop_n_genotypes >= 1, "cellpop_n_genotypes must be ≥ 1"
+        assert self.cellpop_rollout_steps >= 1, "cellpop_rollout_steps must be ≥ 1"
+        assert self.lambda_pop_clone    >= 0, "lambda_pop_clone must be ≥ 0"
+        assert self.lambda_pop_rate     >= 0, "lambda_pop_rate must be ≥ 0"
+        assert 0.0 < self.pop_target_division_rate < 1.0, \
+            "pop_target_division_rate must be in (0, 1)"
+        assert self.pop_cert_every      >= 0, "pop_cert_every must be ≥ 0"
 
 
 # =============================================================================
@@ -1734,6 +1848,283 @@ class BVCertificationBridge:
 
 
 # =============================================================================
+# 14.5  Mode 4 — Cell Population coupling (optional, separate file)
+# =============================================================================
+#
+# CellPopulation (cell_population_one.py) has, by design, ZERO trainable
+# weights of its own — division/death rates are deterministic smooth
+# functions of (a) the local CH3D sigma/u field sampled at each cell's
+# position, and (b) a per-genotype fitness buffer. "Training" it therefore
+# means exactly what `population_mutation_load()` was built for: drive its
+# division/death dynamics with the GNO's *predicted* Mode-3 phase field
+# rather than a ground-truth one, roll the population forward a few steps,
+# and pull the GNO's Mode-3 head toward predictions whose induced clonal
+# dynamics match an observed/target population trajectory. Gradients flow
+# CellPopulation.step() -> _sample_local_sigma (grid_sample, differentiable)
+# -> pred_u -> the GNO's ch3d_head parameters — never into CellPopulation
+# itself, since it has nothing to update.
+#
+# This mirrors BV-1's "certified target, one-directional signal" pattern
+# exactly, except the certifying engine here is CellPopulation's exact
+# agent-based rollout instead of bv_full_theory_one's analytic gauge theory.
+# =============================================================================
+
+@dataclass
+class CellPopulationRollout:
+    """
+    Result of rolling a CellPopulation forward under a GNO-predicted phase
+    field for ``cfg.cellpop_rollout_steps`` steps.
+
+    Gradient path (read carefully before using ``mu_trace``/``rate_trace``
+    in a loss): ``CellPopulation.population_mutation_load()`` is, by its
+    own docstring, differentiable ONLY w.r.t. ``genotype_fitness`` — it
+    explicitly does not propagate through the discrete alive/genotype
+    state, so it carries NO gradient back into a GNO-predicted phase field
+    no matter how the rollout is sampled. The actual differentiable
+    coupling point is ``step()``'s returned ``division_rate`` / `death_rate``
+    tensors, which are smooth sigmoid functions of ``local_sigma`` (hence
+    of ``pred_u``, via ``_sample_local_sigma``'s ``grid_sample`` call) —
+    see ``CellPopulation.step``. ``rate_trace`` below is built from those,
+    and is the tensor Mode-4 training should actually use.
+
+    Attributes:
+        n_alive_trace    : List[int], population size after each step.
+        mu_trace         : (rollout_steps,) tensor, population_mutation_load()
+                           after each step. Diagnostic / logging only — see
+                           the gradient-path note above; do NOT use this for
+                           a training loss expecting gradients into pred_u.
+        rate_trace       : (rollout_steps,) tensor, mean division_rate over
+                           currently-alive cells at each step — fully
+                           differentiable w.r.t. the phase field that drove
+                           ``_sample_local_sigma``, regardless of ``hard``.
+                           (``division_rate`` itself, returned directly by
+                           ``step()``, is a plain sigmoid of ``local_sigma``;
+                           ``hard`` only controls whether the *discrete*
+                           division/death *event* sampled from that rate is
+                           relaxed or not — it does not affect the rate
+                           tensor's own gradient.) This is the correct
+                           tensor to feed to a Mode-4 training loss.
+        clone_freq_final : (n_genotypes,) clone frequencies at the end of
+                           the rollout (diagnostic only — not differentiable,
+                           see ``CellPopulation.clone_frequencies`` docstring).
+        n_divided_total  : total divisions summed across the rollout.
+        n_died_total     : total deaths summed across the rollout.
+    """
+    n_alive_trace:     List[int]
+    mu_trace:          torch.Tensor
+    rate_trace:        torch.Tensor
+    clone_freq_final:  torch.Tensor
+    n_divided_total:   int
+    n_died_total:      int
+
+    def summary(self) -> str:
+        return (
+            f"CellPopulationRollout  n_alive: {self.n_alive_trace[0]} -> "
+            f"{self.n_alive_trace[-1]}  divided={self.n_divided_total}  "
+            f"died={self.n_died_total}  "
+            f"mean_division_rate_final={self.rate_trace[-1].item():.4f}  "
+            f"mu_final={self.mu_trace[-1].item():.4f}"
+        )
+
+
+def loss_population_clone_match(
+    clone_freq_pred: torch.Tensor,
+    clone_freq_target: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Diagnostic clone-frequency matching loss.
+
+    NOTE: ``CellPopulation.clone_frequencies()`` is a counting operation on
+    discrete alive/genotype state (see its docstring) — it carries no
+    gradient back into the GNO. This loss is provided for evaluation /
+    logging (e.g. comparing a trained run's final clone mix against a real
+    cohort's clonal composition) and should NOT be added to the optimised
+    training objective; use ``loss_population_rate_match`` for that.
+
+    Args:
+        clone_freq_pred   : (n_genotypes,) from CellPopulation.clone_frequencies().
+        clone_freq_target : (n_genotypes,) target clone-frequency distribution.
+
+    Returns:
+        Scalar KL(target || pred)-style divergence (clamped, non-differentiable
+        upstream of clone_freq_pred in practice).
+    """
+    eps = 1e-8
+    p = clone_freq_pred.clamp_min(eps)
+    q = clone_freq_target.clamp_min(eps).to(device=p.device, dtype=p.dtype)
+    q = q / q.sum().clamp_min(eps)
+    p = p / p.sum().clamp_min(eps)
+    return (q * (q.log() - p.log())).sum()
+
+
+def loss_population_rate_match(
+    rate_trace: torch.Tensor,
+    rate_target: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Differentiable population-level training loss (Mode 4's primary term).
+
+    Pulls the rollout's per-step mean division-rate trace toward a target
+    trajectory. ``division_rate`` (see ``CellPopulation.step``) is a smooth
+    sigmoid function of ``local_sigma``, which is itself a ``grid_sample``
+    interpolation of the GNO's predicted phase field at each cell's
+    position — so gradients flow from this loss all the way back into the
+    GNO's ``ch3d_head`` parameters. This is the actual mechanism by which
+    "training the cell population module" updates GNO weights; it is the
+    Mode-4 analogue of BV-1's cross-modal distillation term.
+
+    Args:
+        rate_trace  : (T,) tensor from ``CellPopulationRollout.rate_trace``.
+                      Differentiable w.r.t. the GNO's Mode-3 output
+                      regardless of the ``hard`` flag used during the
+                      rollout (see ``CellPopulationRollout`` docstring).
+        rate_target : (T,) or scalar target division-rate trajectory. If a
+                      scalar tensor is given, it is broadcast across all T
+                      steps (e.g. "hold the division rate near 0.1 throughout
+                      the rollout" — a stable, non-exploding/non-collapsing
+                      population target).
+
+    Returns:
+        Scalar MSE loss tensor.
+    """
+    target = rate_target.to(device=rate_trace.device, dtype=rate_trace.dtype)
+    if target.dim() == 0:
+        target = target.expand_as(rate_trace)
+    return F.mse_loss(rate_trace, target)
+
+
+class CellPopulationTrainingBridge:
+    """
+    Composes a ``CellPopulation`` instance with the GNO's Mode-3 (ch3d)
+    output to produce a differentiable Mode-4 training signal.
+
+    Like ``BVCertificationBridge``, this class never re-implements
+    population dynamics — it only (a) owns a ``CellPopulation`` instance
+    sized to match ``cfg``, (b) feeds it the GNO's predicted phase field
+    each rollout step, and (c) degrades to a safe no-op when
+    ``cell_population_one`` is unavailable.
+
+    Args:
+        cfg    : SGNOEvoBVConfig.
+        device : torch device for the (cheap, vectorised) population
+                 rollout. Pinned to CPU by default for the same
+                 device-mismatch-avoidance reason as ``BVCertificationBridge``
+                 — CellPopulation's tensor ops are small relative to the GNO
+                 backbone and grid_sample works identically on CPU.
+    """
+
+    def __init__(self, cfg: SGNOEvoBVConfig, device: Optional[torch.device] = None) -> None:
+        self.cfg     = cfg
+        self.device  = torch.device("cpu")
+        self.available = bool(cfg.enable_cell_population and _HAS_CELL_POPULATION)
+
+        self.population: Optional["CellPopulation"] = None
+        if self.available:
+            pop_cfg = CellPopulationConfig(
+                n_max=cfg.cellpop_n_max,
+                n_genotypes=cfg.cellpop_n_genotypes,
+                device="cpu",
+            )
+            self.population = CellPopulation(pop_cfg)
+        elif cfg.enable_cell_population and not _HAS_CELL_POPULATION:
+            warnings.warn(
+                "SGNOEvoBVConfig.enable_cell_population=True but "
+                "cell_population_one is not importable — Mode-4 cell-"
+                "population training is disabled for this run; Modes 1-3 "
+                "and BV-1/2/3 remain fully active.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+    def set_genotype_fitness(self, fitness: torch.Tensor) -> None:
+        """Forward to ``CellPopulation.set_genotype_fitness`` if available."""
+        if self.available and self.population is not None:
+            self.population.set_genotype_fitness(fitness)
+
+    def reset_population(self, seed: Optional[int] = None) -> None:
+        """Re-spawn the underlying population (e.g. at the start of every epoch)."""
+        if self.available and self.population is not None:
+            self.population.reset(seed=seed)
+
+    def rollout(
+        self,
+        pred_u: torch.Tensor,
+        hard: Optional[bool] = None,
+    ) -> Optional[CellPopulationRollout]:
+        """
+        Roll the attached CellPopulation forward ``cfg.cellpop_rollout_steps``
+        steps, sampling the GNO's predicted Mode-3 phase field at every cell
+        position on every step.
+
+        Args:
+            pred_u : (Nx, Ny, Nz) GNO Mode-3 output (``out["pred_u"]`` from
+                     ``StructuralGNOEvolution._forward_ch3d``). NOT detached
+                     here — keep this tensor's graph alive (i.e. do not call
+                     with ``pred_u.detach()``) if the resulting
+                     ``rate_trace`` is to be used in a training loss (see
+                     ``loss_population_rate_match``).
+            hard   : forwarded to ``CellPopulation.step`` each rollout step.
+                     Controls only whether the *discrete* division/death
+                     *event* sampled from ``division_rate``/``death_rate``
+                     is a hard Bernoulli draw (``True``, eval-style) or a
+                     Gumbel-sigmoid relaxation (``False``, training-style);
+                     ``rate_trace`` itself is differentiable either way,
+                     since it reads the rate tensors directly rather than
+                     the sampled events (see ``CellPopulationRollout``).
+                     Defaults to ``not self.population.training`` via
+                     ``CellPopulation.step``'s own default when left ``None``.
+
+        Returns:
+            CellPopulationRollout, or ``None`` if the bridge is unavailable.
+        """
+        if not self.available or self.population is None:
+            return None
+
+        # Explicit float32 cast: under AMP autocast, pred_u may be float16;
+        # CellPopulation's internals (grid_sample, sigmoid rates) assume
+        # cfg.dtype (float32 by default) and CPU autocast semantics differ
+        # from CUDA's, so this cast is made explicit rather than relying on
+        # an implicit one inside CellPopulation. Differentiable: .to() with
+        # a dtype change is a valid autograd op.
+        u_field = pred_u.to(self.device, dtype=torch.float32)
+        n_alive_trace: List[int] = []
+        mu_steps: List[torch.Tensor] = []
+        rate_steps: List[torch.Tensor] = []
+        n_divided_total = 0
+        n_died_total = 0
+
+        for _ in range(self.cfg.cellpop_rollout_steps):
+            # alive mask is read BEFORE step() mutates it, so the mean below
+            # is over the cells whose division_rate was actually computed
+            # against this step's local_sigma (post-step alive status
+            # reflects who survived/divided, not who the rate applied to).
+            alive_before = self.population.state.alive.clone()
+            step_out = self.population.step(sigma_field=u_field, hard=hard)
+            n_alive_trace.append(int(step_out["n_alive_after"].item()))
+            n_divided_total += int(step_out["n_divided"].item())
+            n_died_total    += int(step_out["n_died"].item())
+            mu_steps.append(self.population.population_mutation_load())
+
+            div_rate = step_out["division_rate"]
+            alive_f  = alive_before.to(div_rate.dtype)
+            n_alive_f = alive_f.sum().clamp_min(1.0)
+            rate_steps.append((div_rate * alive_f).sum() / n_alive_f)
+
+        mu_trace   = torch.stack(mu_steps)
+        rate_trace = torch.stack(rate_steps)
+        clone_freq_final = self.population.clone_frequencies()
+
+        return CellPopulationRollout(
+            n_alive_trace=n_alive_trace,
+            mu_trace=mu_trace,
+            rate_trace=rate_trace,
+            clone_freq_final=clone_freq_final,
+            n_divided_total=n_divided_total,
+            n_died_total=n_died_total,
+        )
+
+
+# =============================================================================
 # 15. StructuralGNOEvolutionBV — Main Model
 # =============================================================================
 
@@ -1743,9 +2134,13 @@ class StructuralGNOEvolutionBV(StructuralGNOEvolution):
 
     Identical architecture and forward dispatcher to the base production
     model (Mode 1 / 2 / 3 all behave exactly as in StructuralGNOEvolution).
-    Adds one new capability: ``forward_certified``, which runs Mode 1 and
-    Mode 3 together and attaches the BV-certified cross-modal Rt boost
-    (BV-1) to the result for inference-time inspection or downstream use.
+    Adds two new capabilities:
+      • ``forward_certified`` — runs Mode 1 and Mode 3 together and attaches
+        the BV-certified cross-modal Rt boost (BV-1) to the result for
+        inference-time inspection or downstream use.
+      • ``self.cellpop_bridge`` — a ``CellPopulationTrainingBridge`` exposing
+        Mode 4 (cell-population) rollouts driven by this model's Mode-3
+        predictions (see ``SGNOEvolutionBVTrainer._compute_losses``).
 
     Args:
         cfg : SGNOEvoBVConfig instance.
@@ -1755,6 +2150,7 @@ class StructuralGNOEvolutionBV(StructuralGNOEvolution):
         super().__init__(cfg)
         self.cfg: SGNOEvoBVConfig = cfg
         self.bv_bridge = BVCertificationBridge(cfg)
+        self.cellpop_bridge = CellPopulationTrainingBridge(cfg)
 
     def forward_certified(
         self,
@@ -1801,7 +2197,7 @@ class SGNOEvolutionBVTrainer(SGNOEvolutionTrainer):
     """
     Trainer for StructuralGNOEvolutionBV.
 
-    Extends ``SGNOEvolutionTrainer`` with three additions, all individually
+    Extends ``SGNOEvolutionTrainer`` with four additions, all individually
     weighted / toggle-able via ``SGNOEvoBVConfig``:
 
       • BV-2 mass conservation on every Mode-3 batch (``lambda_bv_mass``).
@@ -1810,6 +2206,14 @@ class SGNOEvolutionBVTrainer(SGNOEvolutionTrainer):
       • BV-3 periodic analytic certification every ``bv_cert_every`` steps,
         logged into the returned loss dict as ``bv_cme_residual`` /
         ``bv_overall_consistent`` whenever it runs.
+      • Mode 4 — cell population: on every Mode-3 batch, rolls a
+        ``CellPopulation`` forward ``cellpop_rollout_steps`` steps under
+        the GNO's predicted phase field and pulls its induced mean
+        division-rate trajectory toward ``pop_target_division_rate``
+        (``lambda_pop_rate``). Diagnostics (``pop_n_alive``,
+        ``pop_n_divided``, ``pop_n_died``, ``pop_mu_final``) are logged
+        every step; a fuller rollout summary is logged every
+        ``pop_cert_every`` steps (see ``train_step``).
 
     All base-trainer behaviour (AMP, EMA, gradient clipping, NaN guards,
     LR scheduling, checkpointing, early stopping) is unchanged.
@@ -1934,6 +2338,24 @@ class SGNOEvolutionBVTrainer(SGNOEvolutionTrainer):
                     log["loss_bv_distill"] = l_bv_distill.item()
                     log["mu_bv"]           = mu_bv.item()
 
+            # Mode 4 : cell population — reuses pred_u, zero extra GNO
+            # forward calls. The rollout itself (CellPopulation.step x
+            # cellpop_rollout_steps) is cheap and runs on CPU regardless of
+            # which device the GNO lives on; only rate_trace's gradient path
+            # back through grid_sample touches pred_u's autograd graph.
+            if self.model.cellpop_bridge.available:
+                rollout = self.model.cellpop_bridge.rollout(pred_u, hard=False)
+                if rollout is not None:
+                    target = torch.tensor(cfg.pop_target_division_rate)
+                    loss_pop   = loss_population_rate_match(rollout.rate_trace, target)
+                    l_pop      = cfg.lambda_pop_rate * loss_pop.to(pred_u.device)
+                    total_loss = total_loss + l_pop
+                    log["loss_pop_rate"]  = l_pop.item()
+                    log["pop_n_alive"]    = float(rollout.n_alive_trace[-1])
+                    log["pop_n_divided"]  = float(rollout.n_divided_total)
+                    log["pop_n_died"]     = float(rollout.n_died_total)
+                    log["pop_mu_final"]   = rollout.mu_trace[-1].item()
+
         log["total_loss"] = total_loss.item()
         return total_loss, log
 
@@ -1954,9 +2376,10 @@ class SGNOEvolutionBVTrainer(SGNOEvolutionTrainer):
         machinery is delegated to the base class unchanged via
         ``super().train_step(...)`` — it transparently picks up this
         class's single-pass ``_compute_losses`` override through normal
-        method resolution, so the BV-1 / BV-2 terms are included with no
-        duplicated logic here. Only the BV-3 periodic certification hook
-        is added, after the optimiser step.
+        method resolution, so the BV-1 / BV-2 / Mode-4 terms are included
+        with no duplicated logic here. Only two periodic diagnostic hooks
+        are added, after the optimiser step: BV-3 certification and a
+        fuller Mode-4 population-rollout summary log line.
         """
         log = super().train_step(batch_evo, batch_md, batch_ch)
 
@@ -1973,6 +2396,22 @@ class SGNOEvolutionBVTrainer(SGNOEvolutionTrainer):
             if cert is not None:
                 log["bv_cme_residual"]       = cert.cme_residual
                 log["bv_overall_consistent"] = float(cert.overall_consistent)
+
+        if (
+            self.cfg.pop_cert_every > 0
+            and self.model.cellpop_bridge.available
+            and self.global_step > 0
+            and self.global_step % self.cfg.pop_cert_every == 0
+        ):
+            pop = self.model.cellpop_bridge.population
+            if pop is not None:
+                logger.info(
+                    "Step %6d | Mode-4 population: n_alive=%d  "
+                    "loss_pop_rate=%.4f  pop_mu_final=%.4f",
+                    self.global_step, pop.state.n_alive(),
+                    log.get("loss_pop_rate", float("nan")),
+                    log.get("pop_mu_final", float("nan")),
+                )
 
         return log
 
@@ -1991,7 +2430,8 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s | %(message)s")
     print(f"StructuralGNOEvolutionBV v{SGNO_BV_VERSION}  (base SGNO v{SGNO_VERSION}, "
-          f"bv_full_theory_one={'v' + BV_FULL_VERSION if _HAS_BV_FULL_THEORY else 'unavailable'}) "
+          f"bv_full_theory_one={'v' + BV_FULL_VERSION if _HAS_BV_FULL_THEORY else 'unavailable'}, "
+          f"cell_population_one={'v' + CELL_POPULATION_VERSION if _HAS_CELL_POPULATION else 'unavailable'}) "
           f"— standalone single-file edition")
     print("  smoke test")
 
@@ -2002,10 +2442,13 @@ if __name__ == "__main__":
     cfg = SGNOEvoBVConfig(
         hidden_dim=64, num_layers=3, max_epochs=2, log_every=1,
         bv_cert_every=2, bv_cert_max_nodes=8,
+        cellpop_n_max=32, cellpop_n_genotypes=2, cellpop_rollout_steps=3,
+        pop_cert_every=2,
     )
     model = StructuralGNOEvolutionBV(cfg).to(device)
     print(f"  params : {model.num_parameters():,}")
     print(f"  bv_bridge.available : {model.bv_bridge.available}")
+    print(f"  cellpop_bridge.available : {model.cellpop_bridge.available}")
 
     # ── Synthetic batch helpers ──────────────────────────────────────
     N, E, Nx = 12, 24, 4
@@ -2062,7 +2505,29 @@ if __name__ == "__main__":
     print(f"  train_step OK  total_loss={log['total_loss']:.4f}  "
           f"grad_norm={log.get('grad_norm', float('nan')):.4f}  "
           f"loss_bv_mass={log.get('loss_bv_mass', float('nan')):.4f}  "
-          f"loss_bv_distill={log.get('loss_bv_distill', float('nan')):.4f}")
+          f"loss_bv_distill={log.get('loss_bv_distill', float('nan')):.4f}  "
+          f"loss_pop_rate={log.get('loss_pop_rate', float('nan')):.4f}  "
+          f"pop_n_alive={log.get('pop_n_alive', float('nan')):.0f}  "
+          f"pop_mu_final={log.get('pop_mu_final', float('nan')):.4f}")
+
+    # ── Mode-4 gradient-flow verification: pred_u -> rate_trace must carry
+    #    a real gradient back into the GNO's ch3d_head, since this is the
+    #    entire mechanism by which Mode-4 "trains" CellPopulation's
+    #    (parameter-free) dynamics. ──────────────────────────────────────
+    if model.cellpop_bridge.available:
+        model.zero_grad(set_to_none=True)
+        out_ch_probe = model(batch_ch, mode="ch3d")
+        rollout_probe = model.cellpop_bridge.rollout(out_ch_probe["pred_u"], hard=True)
+        rollout_probe.rate_trace.sum().backward()
+        ch3d_head_grad_norm = sum(
+            p.grad.norm().item() for p in model.ch3d_head.parameters() if p.grad is not None
+        )
+        print(f"  Mode-4 gradient-flow check  rate_trace -> ch3d_head  "
+              f"grad_norm={ch3d_head_grad_norm:.6f}  -> "
+              f"{'[PASS] gradient reaches GNO weights' if ch3d_head_grad_norm > 0.0 else '[FAIL] zero gradient'}")
+        model.zero_grad(set_to_none=True)
+    else:
+        print("  [SKIP] Mode-4 gradient-flow check (cell_population_one unavailable)")
 
     # ── forward_certified ────────────────────────────────────────────
     model.eval()
@@ -2106,6 +2571,15 @@ if __name__ == "__main__":
         print(f"  {cert.summary()}")
     else:
         print("  [SKIP] BV-3 certification (bv_full_theory_one unavailable in this environment)")
+
+    # ── Standalone Mode-4 rollout call ───────────────────────────────
+    if model.cellpop_bridge.available:
+        with torch.no_grad():
+            out_ch_final = model(batch_ch, mode="ch3d")
+            rollout = model.cellpop_bridge.rollout(out_ch_final["pred_u"], hard=True)
+        print(f"  {rollout.summary()}")
+    else:
+        print("  [SKIP] Mode-4 rollout (cell_population_one unavailable in this environment)")
 
     print(f"\n[PASS] structural_gno_evolution_bv (standalone) v{SGNO_BV_VERSION} — all checks passed.")
     sys.exit(0)
