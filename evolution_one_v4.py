@@ -123,7 +123,7 @@ HAS_BOWTIE = _has_bowtie()
 # REAL FOLD ONE & HT (fallback to embedded physics engine)
 # -----------------------------------------------------------------------------
 try:
-    from real_fold_one_v2 import (
+    from real_fold_one import (
         RefinementEngine, RefinementConfig,
         CSOCKernel, SOCController, SemanticStateContraction as _RFO_SSC,
         DiffRGRefiner,
@@ -146,7 +146,7 @@ except ImportError:
     _RFO_BV_AVAILABLE = False
 
 try:
-    from real_fold_one_ht_v2 import HighThroughputScanner, HTConfig
+    from real_fold_one_ht import HighThroughputScanner, HTConfig
     HAS_HT = True
 except ImportError:
     HAS_HT = False
@@ -167,7 +167,7 @@ if not logger.handlers:
     logger.addHandler(ch)
 
 # =============================================================================
-# 1. Embedded Physics Engine fallback (when real_fold_one_v2 unavailable)
+# 1. Embedded Physics Engine fallback (when real_fold_one unavailable)
 # =============================================================================
 
 if not HAS_REAL_FOLD_ONE:
@@ -1229,15 +1229,429 @@ class EvolutionONEEngine(LangevinBridgeMixin):
 
 
 # =============================================================================
-# 13. CLI
+# 13. TCGA Real-Data Validation (cBioPortal clinical TSV)
+# =============================================================================
+#
+# Added by Claude (Anthropic), June 2026.
+#
+# Reproduces the "Evolution ONE — REAL TCGA Data" panel-A→K validation figure
+# from cBioPortal pan-can-atlas-2018 clinical TSV exports (BRCA, COADREAD).
+#
+# Threshold-logic bug fix included here (see TCGAValidator.classify
+# docstring): earlier ad-hoc analysis scripts apparently computed regime
+# counts for the bar chart (panel A) from the *full* cohort, but computed
+# Kaplan-Meier survival curves (panel C) only on the *subset* that had
+# non-missing Overall Survival data. Because a few patients have valid
+# Mutation Count but missing OS, the two panels' "n per regime" disagreed
+# (this is what produced the n=1 vs n=8 "Collapse" mismatch in the earlier
+# figure). This implementation classifies regimes once on the
+# analysis-ready dataframe (rows with valid mu AND valid OS) and reuses
+# that single classification for every panel, so all counts are
+# guaranteed self-consistent.
+# =============================================================================
+
+@dataclass
+class TCGAValidationConfig:
+    """
+    Config for TCGAValidator.
+
+    mu_source: how to compute the SOC mutation load μ per patient.
+      - "tmb"      : μ = TMB (nonsynonymous), min-max normalised to [0,1]
+                     across the pooled cohort. Preferred when present since
+                     TMB is already mutations/Mb (panel length-normalised).
+      - "mutcount" : μ = raw "Mutation Count", min-max normalised to [0,1].
+                     Used as fallback when TMB column is absent/empty.
+      - "auto"     : use "tmb" if available for a row, else fall back to
+                     "mutcount" for that row (default).
+    """
+    mu_source: str = "auto"
+    threshold_stable:   float = 0.2
+    threshold_collapse: float = 0.8
+    tune_thresholds:    bool = True
+    tune_n_iter:        int = 50
+    tune_method:        str = "differential_evolution"
+    random_seed:        int = 42
+
+
+class TCGAValidator:
+    """
+    Loads cBioPortal pan-can-atlas-2018 clinical_data.tsv exports, computes
+    SOC mutation load μ, classifies Stable/Critical/Collapse regimes using
+    EvolutionaryClassifier, and renders the panel A-K validation figure.
+
+    Usage:
+        v = TCGAValidator()
+        df = v.run({"BRCA": "brca_..._clinical_data.tsv",
+                     "COAD": "coadread_..._clinical_data.tsv"},
+                    save_path="evolution_one_tcga_validation.png")
+    """
+
+    REQUIRED_COLUMNS = [
+        "Patient ID", "Sample ID", "Mutation Count", "TMB (nonsynonymous)",
+        "Overall Survival (Months)", "Overall Survival Status",
+        "American Joint Committee on Cancer Tumor Stage Code",
+        "Subtype",
+    ]
+
+    def __init__(self, cfg: TCGAValidationConfig = None):
+        self.cfg = cfg or TCGAValidationConfig()
+        self.classifier = EvolutionaryClassifier(
+            threshold_stable=self.cfg.threshold_stable,
+            threshold_collapse=self.cfg.threshold_collapse,
+        )
+
+    # ------------------------------------------------------------------ #
+    # 1. Load
+    # ------------------------------------------------------------------ #
+    def load_cohort(self, tsv_paths: Dict[str, str]) -> pd.DataFrame:
+        """
+        tsv_paths: dict mapping a short cohort label (e.g. "BRCA", "COAD")
+        to a cBioPortal clinical_data.tsv file path. Files are concatenated
+        with a "CohortLabel" column added so downstream code can stratify
+        by cancer type (panel B).
+        """
+        frames = []
+        for label, path in tsv_paths.items():
+            df = pd.read_csv(path, sep="\t", low_memory=False)
+            missing = [c for c in self.REQUIRED_COLUMNS if c not in df.columns]
+            if missing:
+                logger.warning(
+                    "TCGAValidator: %s missing columns %s — those panels "
+                    "will be skipped/NaN for this cohort.", label, missing)
+            df["CohortLabel"] = label
+            frames.append(df)
+        combined = pd.concat(frames, ignore_index=True, sort=False)
+        logger.info("TCGAValidator: loaded %d total patients across %d cohorts",
+                     len(combined), len(tsv_paths))
+        return combined
+
+    # ------------------------------------------------------------------ #
+    # 2. Compute μ
+    # ------------------------------------------------------------------ #
+    def compute_mu(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+
+        mut_count = pd.to_numeric(
+            df.get("Mutation Count", np.nan), errors="coerce")
+        tmb = pd.to_numeric(
+            df.get("TMB (nonsynonymous)", np.nan), errors="coerce")
+
+        if self.cfg.mu_source == "tmb":
+            raw = tmb
+        elif self.cfg.mu_source == "mutcount":
+            raw = mut_count
+        else:  # "auto": prefer TMB, fall back to Mutation Count per-row
+            raw = tmb.where(tmb.notna(), mut_count)
+
+        df["_mu_raw"] = raw
+
+        # Drop rows with no usable mutation-load signal at all — these
+        # cannot be classified into a SOC regime and must not silently
+        # appear as a phantom "Stable" (mu=0) patient.
+        n_before = len(df)
+        df = df[df["_mu_raw"].notna()].copy()
+        n_dropped = n_before - len(df)
+        if n_dropped:
+            logger.info("TCGAValidator: dropped %d/%d patients with no "
+                         "Mutation Count or TMB value", n_dropped, n_before)
+
+        # Min-max normalise to [0,1] over the pooled cohort actually used,
+        # matching the θ_s≈0.15 / θ_c≈0.57 scale seen in the reference figure.
+        mu_min, mu_max = df["_mu_raw"].min(), df["_mu_raw"].max()
+        if mu_max > mu_min:
+            df["mu"] = (df["_mu_raw"] - mu_min) / (mu_max - mu_min)
+        else:
+            df["mu"] = 0.0
+
+        # RG smoothing via the engine's own DifferentiableRG, applied across
+        # the pooled cohort exactly as EvolutionONEEngine.run() does for
+        # MAF/VCF input (step 3 there) — keeps μ definition consistent
+        # between the CLI pipeline and this validation pipeline.
+        mu_tensor = torch.tensor(df["mu"].values, dtype=torch.float32)
+        df["mu_smooth"] = self.classifier.rg(mu_tensor).detach().numpy()
+
+        return df
+
+    # ------------------------------------------------------------------ #
+    # 3. Classify (single source of truth for every panel's regime counts)
+    # ------------------------------------------------------------------ #
+    def _parse_os(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Parse OS months (float) and OS event indicator (1=dead, 0=censored)."""
+        df = df.copy()
+        df["_os_months"] = pd.to_numeric(
+            df.get("Overall Survival (Months)", np.nan), errors="coerce")
+        status = df.get("Overall Survival Status", pd.Series(
+            [None] * len(df), index=df.index))
+        # cBioPortal encodes this as "0:LIVING" / "1:DECEASED"
+        df["_os_event"] = status.astype(str).str.startswith("1").astype(float)
+        df.loc[status.isna(), "_os_event"] = np.nan
+        return df
+
+    def classify(self, df: pd.DataFrame,
+                 require_os: bool = True) -> pd.DataFrame:
+        """
+        Classifies every patient into Stable/Critical/Collapse using
+        EvolutionaryClassifier on `mu_smooth`.
+
+        If require_os=True (default), rows lacking usable OS data are
+        dropped *before* classification, so the regime counts returned
+        here are the exact n's that will later appear in both the panel-A
+        bar chart and the panel-C Kaplan-Meier legend — eliminating the
+        bug where those two panels disagreed (n=1 vs n=8).
+        """
+        df = self._parse_os(df)
+
+        if require_os:
+            n_before = len(df)
+            df = df[df["_os_months"].notna() & df["_os_event"].notna()].copy()
+            n_dropped = n_before - len(df)
+            if n_dropped:
+                logger.info(
+                    "TCGAValidator: dropped %d/%d patients with missing "
+                    "Overall Survival data before regime classification — "
+                    "this keeps panel A and panel C sample counts "
+                    "consistent.", n_dropped, n_before)
+
+        mu_values = df["mu_smooth"].values
+
+        if self.cfg.tune_thresholds:
+            # Clinical proxy label for threshold tuning: 1.0 = patient alive
+            # (good outcome), 0.0 = deceased. tune_thresholds() (existing
+            # method, unmodified) maximises |correlation| between this label
+            # and the predicted regime, exactly as it does for the CLI path.
+            clinical_label = 1.0 - df["_os_event"].values
+            if np.std(clinical_label) > 0 and len(df) > 10:
+                random.seed(self.cfg.random_seed)
+                np.random.seed(self.cfg.random_seed)
+                self.classifier.tune_thresholds(
+                    mu_values, clinical_label,
+                    n_iter=self.cfg.tune_n_iter,
+                    method=self.cfg.tune_method)
+                logger.info(
+                    "TCGAValidator: tuned thresholds stable=%.3f collapse=%.3f",
+                    self.classifier.threshold_stable,
+                    self.classifier.threshold_collapse)
+
+        df["state"] = self.classifier.classify_samples(mu_values)
+        df["regime"] = df["state"].map({0: "Stable", 1: "Critical", 2: "Collapse"})
+        return df
+
+    # ------------------------------------------------------------------ #
+    # 4. Plot panels A-K
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _kaplan_meier(times: np.ndarray, events: np.ndarray):
+        """
+        Minimal Kaplan-Meier estimator (no external dependency on lifelines).
+        Returns (time_grid, survival_prob) step-function arrays suitable for
+        plt.step(..., where='post').
+        """
+        order = np.argsort(times)
+        t_sorted = times[order]
+        e_sorted = events[order]
+        unique_times = np.unique(t_sorted)
+
+        s = 1.0
+        surv = [1.0]
+        grid = [0.0]
+        n_at_risk = len(t_sorted)
+        for t in unique_times:
+            mask = t_sorted == t
+            n_events = e_sorted[mask].sum()
+            n_here = mask.sum()
+            if n_at_risk > 0 and n_events > 0:
+                s *= (1.0 - n_events / n_at_risk)
+            grid.append(t)
+            surv.append(s)
+            n_at_risk -= n_here
+        return np.array(grid), np.array(surv)
+
+    @staticmethod
+    def _logrank_test(times_a, events_a, times_b, events_b):
+        """
+        Two-group log-rank test (standard formulation), returns (chi2, p_value).
+        Avoids requiring `lifelines` just for a single statistic.
+        """
+        times = np.concatenate([times_a, times_b])
+        events = np.concatenate([events_a, events_b])
+        group = np.concatenate([np.zeros(len(times_a)), np.ones(len(times_b))])
+
+        order = np.argsort(times)
+        times, events, group = times[order], events[order], group[order]
+        unique_event_times = np.unique(times[events == 1])
+
+        O_a = E_a = V = 0.0
+        for t in unique_event_times:
+            at_risk = times >= t
+            n_total = at_risk.sum()
+            n_a = (at_risk & (group == 0)).sum()
+            n_b = (at_risk & (group == 1)).sum()
+            d_mask = (times == t) & (events == 1)
+            d_total = d_mask.sum()
+            d_a = (d_mask & (group == 0)).sum()
+            if n_total <= 1:
+                continue
+            e_a = d_total * n_a / n_total
+            var = (d_total * (n_a / n_total) * (n_b / n_total)
+                   * (n_total - d_total) / (n_total - 1))
+            O_a += d_a
+            E_a += e_a
+            V += var
+
+        if V <= 0:
+            return 0.0, 1.0
+        chi2 = (O_a - E_a) ** 2 / V
+        from scipy.stats import chi2 as _chi2_dist
+        p_value = float(_chi2_dist.sf(chi2, df=1))
+        return float(chi2), p_value
+
+    def plot_panels(self, df: pd.DataFrame, save_path: str = None,
+                     title: str = "Evolution ONE — REAL TCGA Data"):
+        """
+        Renders panels A, B, C, E, F, K — every panel derivable purely from
+        the clinical TSV columns used here. Panels G/H/I/J require
+        mutation-level MAF/VCF or kernel-internal data not present in the
+        clinical TSV and are intentionally omitted rather than faked.
+        """
+        n_total = len(df)
+        counts = df["regime"].value_counts().reindex(
+            ["Stable", "Critical", "Collapse"]).fillna(0).astype(int)
+        H = self.classifier.compute_entropy(df["state"].values)
+
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+        fig.suptitle(f"{title}  (N={n_total})\nSOC-Controlled Cancer Evolution",
+                     fontsize=13, fontweight="bold")
+
+        # --- Panel A: SOC Regime Classification ---
+        ax = axes[0, 0]
+        bars = ax.bar(counts.index, counts.values, color="#1f77b4")
+        for b, v in zip(bars, counts.values):
+            ax.text(b.get_x() + b.get_width() / 2, v, str(v),
+                    ha="center", va="bottom", fontweight="bold")
+        ax.set_title(f"A: SOC Regime Classification\nN={n_total}  H={H:.3f} bits")
+        ax.set_ylabel("Patients")
+
+        # --- Panel B: μ distribution by cohort ---
+        ax = axes[0, 1]
+        for label in df["CohortLabel"].unique():
+            sub = df[df["CohortLabel"] == label]
+            ax.hist(sub["mu_smooth"], bins=30, alpha=0.5,
+                    density=True, label=f"{label} (n={len(sub)})")
+        ax.axvline(self.classifier.threshold_stable, color="orange",
+                   linestyle="--", label=f"θ_s={self.classifier.threshold_stable:.2f}")
+        ax.axvline(self.classifier.threshold_collapse, color="red",
+                   linestyle="--", label=f"θ_c={self.classifier.threshold_collapse:.2f}")
+        ax.set_title("B: μ distribution by cancer type")
+        ax.set_xlabel("SOC mutation load μ"); ax.set_ylabel("Density")
+        ax.legend(fontsize=8)
+
+        # --- Panel C: Kaplan-Meier by SOC regime ---
+        ax = axes[0, 2]
+        colors = {"Stable": "green", "Critical": "orange", "Collapse": "red"}
+        km_data = {}
+        for regime in ["Stable", "Critical", "Collapse"]:
+            sub = df[df["regime"] == regime]
+            if len(sub) == 0:
+                continue
+            grid, surv = self._kaplan_meier(
+                sub["_os_months"].values, sub["_os_event"].values)
+            km_data[regime] = sub
+            median_os = sub["_os_months"].median()
+            ax.step(grid, surv, where="post", color=colors[regime],
+                    label=f"{regime} n={len(sub)} OS={median_os:.0f}mo")
+        ax.set_title("C: Kaplan-Meier by SOC regime\n(n's match panel A by construction)")
+        ax.set_xlabel("Time (months)"); ax.set_ylabel("Overall Survival")
+        ax.legend(fontsize=8)
+        if "Stable" in km_data and "Critical" in km_data:
+            _, p_sc = self._logrank_test(
+                km_data["Stable"]["_os_months"].values,
+                km_data["Stable"]["_os_event"].values,
+                km_data["Critical"]["_os_months"].values,
+                km_data["Critical"]["_os_event"].values)
+            ax.text(0.5, 0.15, f"Stable vs Critical\np={p_sc:.3e}"
+                    + ("*" if p_sc < 0.05 else ""),
+                    transform=ax.transAxes, fontsize=9,
+                    bbox=dict(boxstyle="round", fc="lightyellow"))
+
+        # --- Panel E: subtype μ gradient (only if Subtype column present) ---
+        ax = axes[1, 0]
+        if "Subtype" in df.columns and df["Subtype"].notna().any():
+            grp = df.dropna(subset=["Subtype"]).groupby("Subtype")["mu_smooth"]
+            means, stds, ns = grp.mean(), grp.std(), grp.count()
+            order = means.sort_values().index
+            ax.bar(order, means[order], yerr=stds[order].fillna(0))
+            for i, lbl in enumerate(order):
+                ax.text(i, means[lbl], f"n={ns[lbl]}", ha="center", va="bottom",
+                        fontsize=8)
+            ax.set_title("E: Subtype μ gradient")
+        else:
+            ax.set_title("E: Subtype μ gradient\n(no Subtype column — skipped)")
+        ax.set_ylabel("Mean SOC load μ")
+        ax.tick_params(axis="x", rotation=30)
+
+        # --- Panel F: OS by regime (boxplot) ---
+        ax = axes[1, 1]
+        box_data = [df[df["regime"] == r]["_os_months"].dropna().values
+                    for r in ["Stable", "Critical", "Collapse"]]
+        ax.boxplot(box_data, labels=["Stable", "Critical", "Collapse"])
+        ax.set_title("F: OS by SOC regime")
+        ax.set_ylabel("Overall Survival (months)")
+
+        # --- Panel K: μ by AJCC stage ---
+        ax = axes[1, 2]
+        stage_col = "American Joint Committee on Cancer Tumor Stage Code"
+        if stage_col in df.columns:
+            stage_simplified = df[stage_col].astype(str).str.extract(
+                r"(I{1,3}V?|IV)")[0]
+            valid = stage_simplified.notna()
+            stages_present = [s for s in ["I", "II", "III", "IV"]
+                               if (stage_simplified == s).any()]
+            data = [df.loc[valid & (stage_simplified == s), "mu_smooth"].values
+                    for s in stages_present]
+            ax.boxplot(data, labels=stages_present)
+            for i, s in enumerate(stages_present):
+                n_s = (stage_simplified == s).sum()
+                ax.text(i + 1, 0, f"n={n_s}", ha="center", va="top", fontsize=8)
+            ax.set_title("K: μ by AJCC stage")
+        else:
+            ax.set_title("K: μ by AJCC stage\n(no stage column — skipped)")
+        ax.set_ylabel("SOC mutation load μ")
+
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=200, bbox_inches="tight")
+            logger.info("TCGAValidator: figure saved to %s", save_path)
+        return fig
+
+    # ------------------------------------------------------------------ #
+    # 5. One-shot convenience wrapper
+    # ------------------------------------------------------------------ #
+    def run(self, tsv_paths: Dict[str, str],
+            save_path: str = None) -> pd.DataFrame:
+        df = self.load_cohort(tsv_paths)
+        df = self.compute_mu(df)
+        df = self.classify(df, require_os=True)
+        self.plot_panels(df, save_path=save_path)
+        return df
+
+
+# =============================================================================
+# 14. CLI
 # =============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
         description="EVOLUTION ONE v4 – Full Cancer Evolution Engine")
-    parser.add_argument("--input",   "-i", required=True)
+    parser.add_argument("--tcga_validate", nargs="+", metavar="LABEL=PATH",
+                        help="Run TCGAValidator instead of the main MAF/VCF "
+                             "pipeline. Pass one or more LABEL=PATH pairs, "
+                             "e.g. --tcga_validate BRCA=brca_clinical.tsv "
+                             "COAD=coadread_clinical.tsv")
+    parser.add_argument("--tcga_save", default="evolution_one_tcga_validation.png",
+                        help="Output path for the TCGAValidator panel figure")
+    parser.add_argument("--input",   "-i", required=False)
     parser.add_argument("--format",  default="maf", choices=["maf", "vcf"])
-    parser.add_argument("--genes",   nargs="+", required=True)
+    parser.add_argument("--genes",   nargs="+")
     parser.add_argument("--duon_bed",  help="Duon regions in BED format")
     parser.add_argument("--lifestyle_file")
     parser.add_argument("--ref_genome",
@@ -1255,6 +1669,23 @@ def main():
     parser.add_argument("--batch_size",  type=int, default=500)
     parser.add_argument("--plot",        action="store_true")
     args = parser.parse_args()
+
+    if args.tcga_validate:
+        tsv_paths = {}
+        for pair in args.tcga_validate:
+            if "=" not in pair:
+                print(f"--tcga_validate entries must be LABEL=PATH, got: {pair}")
+                sys.exit(1)
+            label, path = pair.split("=", 1)
+            tsv_paths[label] = path
+        validator = TCGAValidator()
+        validator.run(tsv_paths, save_path=args.tcga_save)
+        print(f"TCGA validation figure saved to {args.tcga_save}")
+        return
+
+    if not args.input or not args.genes:
+        print("--input and --genes are required unless --tcga_validate is used.")
+        sys.exit(1)
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
