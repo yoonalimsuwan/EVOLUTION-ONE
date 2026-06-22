@@ -1094,9 +1094,16 @@ class EvolutionONEEngine(LangevinBridgeMixin):
                             self.classifier.threshold_collapse)
 
         # 7. Predictive evolution
-        mu_avg    = float(mu_smooth.mean())
-        mu_t_avg  = torch.tensor(mu_avg).unsqueeze(0)
-        future_mu_soc = self.classifier.soc_evolve(mu_t_avg, steps=20)
+        # NOTE (fix): soc_evolve's `spread` term is a soft range estimator
+        # (logsumexp-based soft max - soft min) over the *batch* dimension.
+        # Feeding it a single-element tensor (the cohort mean) makes spread
+        # collapse algebraically to 2x, so the SOC dynamics degenerate into a
+        # trivial decay that never reflects the cohort's actual criticality.
+        # Feed the full per-sample cohort instead so spread is meaningful,
+        # then reduce to a scalar for the downstream risk decision.
+        mu_avg        = float(mu_smooth.mean())
+        mu_t_cohort   = torch.tensor(mu_smooth, dtype=torch.float32)
+        future_mu_soc = self.classifier.soc_evolve(mu_t_cohort, steps=20).mean()
         future_mu_ito = self.classifier.ito_evolve(mu_avg, steps=100)
         cancer_risk   = ("High"
                          if (self.classifier.mu_to_state(future_mu_soc.item()) == 2
