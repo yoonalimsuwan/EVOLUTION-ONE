@@ -105,7 +105,7 @@ def _has_bowtie():
 HAS_BOWTIE = _has_bowtie()
 
 try:
-    from real_fold_one import (
+    from real_fold_one_v2 import (
         RefinementEngine as _RFO_Engine,
         RefinementConfig as _RFO_Config,
         CSOCKernel, SOCController,
@@ -117,7 +117,7 @@ except ImportError:
     HAS_REAL_FOLD_ONE = False
 
 try:
-    from real_fold_one_ht import HighThroughputScanner, HTConfig
+    from real_fold_one_ht_v2 import HighThroughputScanner, HTConfig
     HAS_HT = True
 except ImportError:
     HAS_HT = False
