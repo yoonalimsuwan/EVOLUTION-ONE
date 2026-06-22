@@ -123,7 +123,7 @@ HAS_BOWTIE = _has_bowtie()
 # REAL FOLD ONE & HT (fallback to embedded physics engine)
 # -----------------------------------------------------------------------------
 try:
-    from real_fold_one import (
+    from real_fold_one_v2 import (
         RefinementEngine, RefinementConfig,
         CSOCKernel, SOCController, SemanticStateContraction as _RFO_SSC,
         DiffRGRefiner,
@@ -146,7 +146,7 @@ except ImportError:
     _RFO_BV_AVAILABLE = False
 
 try:
-    from real_fold_one_ht import HighThroughputScanner, HTConfig
+    from real_fold_one_ht_v2 import HighThroughputScanner, HTConfig
     HAS_HT = True
 except ImportError:
     HAS_HT = False
@@ -167,7 +167,7 @@ if not logger.handlers:
     logger.addHandler(ch)
 
 # =============================================================================
-# 1. Embedded Physics Engine fallback (when real_fold_one unavailable)
+# 1. Embedded Physics Engine fallback (when real_fold_one_v2 unavailable)
 # =============================================================================
 
 if not HAS_REAL_FOLD_ONE:
