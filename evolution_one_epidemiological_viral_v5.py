@@ -1056,11 +1056,21 @@ class EpiForecastEngine(LangevinBridgeMixin):
                     int(np.sum(states == 1)), int(np.sum(states == 2)))
 
         # 4. Future prediction
-        rt_last = torch.tensor([rt_np[-1]]).unsqueeze(0).to(self.device)
+        # NOTE (fix): DifferentiableSOC's `spread` term is a soft range
+        # estimator (logsumexp soft max - soft min) computed across the
+        # batch/sequence dimension. Feeding it a single value (just rt_np[-1])
+        # makes spread collapse algebraically to 2*rt, so the SOC step never
+        # actually reflects recent Rt volatility -- same degeneracy fixed in
+        # EVOLUTION ONE's soc_evolve call. Use a recent window of the smoothed
+        # Rt trajectory instead, so spread is a meaningful statistic, and read
+        # the risk off the last time-step of the evolved window.
+        window      = rt_np[-min(14, len(rt_np)):]
+        rt_window   = torch.tensor(window, dtype=torch.float32).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            lp_fut, _ = self.classifier(rt_last, return_trajectory=True)
-            fut_state = torch.argmax(F.softmax(lp_fut, dim=-1)).item()
-        pandemic_risk = ["Low", "Moderate", "High"][int(fut_state)]
+            lp_fut, _ = self.classifier(rt_window, return_trajectory=True)
+            fut_state = torch.argmax(F.softmax(lp_fut, dim=-1), dim=-1).squeeze().cpu().numpy()
+            fut_state = int(np.atleast_1d(fut_state)[-1])
+        pandemic_risk = ["Low", "Moderate", "High"][fut_state]
         logger.info("Predicted pandemic risk: %s", pandemic_risk)
 
         # 5. BV check
