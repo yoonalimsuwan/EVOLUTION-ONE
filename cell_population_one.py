@@ -106,6 +106,29 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
+
+def _soft_clamp(x: torch.Tensor, lo: float, hi: float,
+                 beta: float = 20.0) -> torch.Tensor:
+    """
+    Differentiable two-sided clamp into [lo, hi]: near-identity in the
+    interior, smooth saturation only near the lo/hi boundaries, nonzero
+    gradient everywhere (unlike torch.Tensor.clamp, which has exactly zero
+    gradient at every point where the input is outside [lo, hi]).
+
+    Implemented as a softplus floor followed by a softplus ceiling:
+        y = lo + softplus(x - lo, beta)   # soft floor at lo
+        y = hi - softplus(hi - y, beta)   # soft ceiling at hi
+
+    This is the same "soft-clamped, not hard .clamp()" convention already
+    used for death_rate_floor / division_rate_ceiling in
+    CellPopulationConfig (see _rate_from_logit), generalised to a plain
+    two-sided clamp for use on field tensors (e.g. the CH3D phase field u)
+    rather than a (floor, ceiling)-bounded *rate*.
+    """
+    y = lo + F.softplus(x - lo, beta=beta)
+    y = hi - F.softplus(hi - y, beta=beta)
+    return y
+
 # =============================================================================
 # Ecosystem imports — single source of truth, graceful fallback for
 # standalone use (mirrors the pattern used throughout EVOLUTION ONE).
@@ -1487,7 +1510,18 @@ class CellPopulationCahnHilliardBridge:
         """
         self.population.step(sigma_field=sigma)
         source = self.cells_to_source_field()
-        u_sourced = (u + source).clamp(-1.0, 1.0)
+        u_raw = u + source
+        # Bug fix (June 2026): hard .clamp(-1, 1) zeroed the gradient
+        # wherever (u + source) saturated outside [-1, 1] — exactly the
+        # regime where mutant-cell density pushes u hardest, i.e. precisely
+        # where the population->field coupling gradient matters most for
+        # training. Replaced with the same softplus-pair soft-clamp already
+        # used elsewhere in this module for death_rate_floor /
+        # division_rate_ceiling (see CellPopulationConfig docstring:
+        # "soft-clamped, not hard .clamp()") — near-identity in the
+        # interior, smooth saturation only near the +-1 boundary, nonzero
+        # gradient everywhere.
+        u_sourced = _soft_clamp(u_raw, -1.0, 1.0)
         u_new = self.ch.step(u_sourced, sigma)
         return u_new, (sigma if sigma is not None else torch.ones_like(u))
 
