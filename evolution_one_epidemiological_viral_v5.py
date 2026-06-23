@@ -976,6 +976,18 @@ class EpiForecastEngine(LangevinBridgeMixin):
         Gradient-based training of EpidemicClassifier thresholds.
 
         DIFF-FIX 7: uses AMP GradScaler on CUDA for memory efficiency.
+
+        Bug fix (June 2026): EpidemicClassifier.forward() treats its input
+        as a (B, T) batch of Rt sequences and returns log-probs shaped
+        (B, T, 3) — one 3-way prediction per timestep. With a single
+        sequence of T timepoints, rt_t has shape (T,), forward()
+        unsqueezes it to (1, T), and log_p comes back (1, T, 3).
+        F.nll_loss always treats dim=1 of its input as the class axis,
+        so passing (1, T, 3) directly made it interpret T as the number of
+        classes and expect a target of shape (1, 3) — a hard shape
+        mismatch against lbl_t's actual shape (T,), which raised at every
+        call. Fix: squeeze the size-1 batch dim so log_p is (T, 3),
+        lining up correctly with one label per timestep in lbl_t.
         """
         rt_t  = torch.tensor(rt_values, dtype=torch.float32).to(self.device)
         lbl_t = torch.tensor(labels,    dtype=torch.long).to(self.device)
@@ -985,13 +997,13 @@ class EpiForecastEngine(LangevinBridgeMixin):
             if self.scaler is not None:
                 with autocast():
                     log_p, _ = self.classifier(rt_t, return_trajectory=True)
-                    loss      = F.nll_loss(log_p, lbl_t)
+                    loss      = F.nll_loss(log_p.squeeze(0), lbl_t)
                 self.scaler.scale(loss).backward()
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 log_p, _ = self.classifier(rt_t, return_trajectory=True)
-                loss      = F.nll_loss(log_p, lbl_t)
+                loss      = F.nll_loss(log_p.squeeze(0), lbl_t)
                 loss.backward()
                 self.optimizer.step()
             if (epoch + 1) % 20 == 0:
