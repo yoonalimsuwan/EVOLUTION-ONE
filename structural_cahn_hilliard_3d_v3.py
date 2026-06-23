@@ -297,8 +297,33 @@ _SOFTPLUS_B = 100.0
 
 
 def _softplus_floor(x: torch.Tensor, floor: float,
-                    beta: float = _SOFTPLUS_B) -> torch.Tensor:
-    """Differentiable lower bound: floor + softplus(x - floor)."""
+                    beta: Optional[float] = None,
+                    rel_tol: float = 0.01) -> torch.Tensor:
+    """
+    Differentiable lower bound: floor + softplus(x - floor, beta).
+
+    Bug fix (June 2026): a smooth softplus-based floor can never be exactly
+    ``floor`` at ``x == floor`` while still guaranteeing ``output >= floor``
+    everywhere (softplus(t, beta) > 0 strictly for all finite t) — so the
+    previous implementation's fixed ``beta=100`` was not itself wrong about
+    that part. The real bug was that ``beta=100`` was a fixed *absolute*
+    sharpness regardless of ``floor``'s scale: the unavoidable offset at
+    x == floor is ``softplus(0, beta) = ln(2)/beta ≈ 0.00693`` for beta=100,
+    which is ~7x LARGER than the typical ``sigma_min=1e-3`` default — so the
+    "floor" was effectively ~8x higher than configured, for every floor
+    smaller than ~0.07.
+
+    Fix: choose beta (when not explicitly given) so the unavoidable offset
+    is a small fixed *fraction* of floor (``rel_tol``, default 1%) instead
+    of a scale-independent absolute constant. This keeps the lower-bound
+    guarantee intact (output >= floor for all x, including x -> -inf) while
+    making the offset negligible relative to floor regardless of how small
+    floor is. An explicit ``beta`` overrides this and is used as-is (for
+    callers that need a specific sharpness for other reasons, e.g. the
+    thin-film mobility kernel which is unrelated to sigma_min's scale).
+    """
+    if beta is None:
+        beta = math.log(2.0) / max(floor * rel_tol, 1e-12)
     return floor + F.softplus(x - floor, beta=beta)
 
 
@@ -1151,10 +1176,26 @@ class PhaseFieldCrystal3D(StructuralCahnHilliard3D):
         """
         IMEX for PFC.
 
-        Implicit denominator absorbs k^2, k^4, k^6 terms:
-            denom = 1 + dt*M*sigma_mean*(k^2 + k^4 + k^6)
+        mu_PFC = (r*u + u^3) + u + 2*Delta_S(u) + Delta_S^2(u)
+        du/dt  = Delta_S(mu_PFC)
+               = Delta_S(r*u+u^3)            [nonlinear, explicit]
+               + Delta_S(u) + 2*Delta_S^2(u) + Delta_S^3(u)   [linear, implicit]
 
-        Explicit part: nonlinear + lower-order linear terms.
+        In Fourier space (Delta_S ~ -k^2 under the sigma_mean/locally-frozen
+        approximation used for the implicit preconditioner), the linear part
+        has symbol  -k^2 + 2*k^4 - k^6  =  -k^2*(1 - k^2)^2,  i.e. the
+        standard PFC dispersion relation. Backward-Euler on that linear part
+        gives the denominator below.
+
+        Bug fix (June 2026): the previous version (a) included the linear
+        terms ``u + 2*lap1`` in the EXPLICIT ``nonlin`` *and* (b) absorbed
+        k^2, k^4, k^6 into the denominator with the wrong combined sign
+        ``(k^2 + k^4 + k^6)`` instead of ``k^2*(1-k^2)^2 = k^2 - 2*k^4 + k^6``
+        — double-counting the linear operator and getting its dispersion
+        relation wrong, so the scheme did not converge to correct PFC
+        dynamics even in the linear regime. Fixed: explicit part now carries
+        only the true nonlinear term Delta_S(r*u+u^3); the denominator uses
+        the correct k^2*(1-k^2)^2 symbol for the full linear operator.
         """
         cfg        = self.cfg
         nx, ny, nz = u.shape
@@ -1164,15 +1205,17 @@ class PhaseFieldCrystal3D(StructuralCahnHilliard3D):
         sigma_mean = sigma.mean()
         r          = cfg.pfc_r
 
-        lap1   = self._structural_laplacian(u, sigma)
-        nonlin = (r * u + u**3) + u + 2.0 * lap1
+        df_du  = r * u + u ** 3
+        nonlin = self._structural_laplacian(df_du, sigma)
 
         u_hat      = torch.fft.rfftn(u,      norm="ortho")
         nonlin_hat = torch.fft.rfftn(nonlin, norm="ortho")
 
         k4    = k2 ** 2
         k6    = k2 ** 3
-        denom = 1.0 + cfg.dt * cfg.mobility * sigma_mean * (k2 + k4 + k6)
+        # Correct PFC linear dispersion symbol: k^2*(1-k^2)^2 = k^2 - 2*k^4 + k^6
+        lin_symbol = k2 - 2.0 * k4 + k6
+        denom = 1.0 + cfg.dt * cfg.mobility * sigma_mean * lin_symbol
         u_new_hat = (u_hat + cfg.dt * cfg.mobility * nonlin_hat) / denom
         u_new = torch.fft.irfftn(u_new_hat, s=(nx, ny, nz), norm="ortho")
 
