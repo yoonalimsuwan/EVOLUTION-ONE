@@ -340,13 +340,24 @@ class DuonAnalyzer:
                 "Mutation DataFrame missing genomic columns; duon rate set to 0.")
             return 0.0
         try:
-            mut_gr  = pr.PyRanges(mutation_df.rename(columns={
-                "Chromosome":     "Chromosome",
+            # Bug fix (3): tag every mutation row with a unique synthetic ID
+            # before the join. A single mutation can overlap >1 duon interval
+            # (e.g. fragmented/overlapping BED entries), and `join` emits one
+            # output row per overlapping pair. Without de-duplication the
+            # resulting rate can exceed 1.0. We count *distinct mutations*
+            # that overlap at least one duon, not the number of overlap pairs.
+            mut_for_join = mutation_df.reset_index(drop=True).copy()
+            mut_for_join["_mut_row_id"] = mut_for_join.index
+            mut_gr = pr.PyRanges(mut_for_join.rename(columns={
                 "Start_Position": "Start",
                 "End_Position":   "End",
             }))
             overlap = mut_gr.join(self.duon_intervals, how="inner")
-            return len(overlap) / max(len(mutation_df), 1)
+            if len(overlap) == 0:
+                return 0.0
+            overlap_df = overlap.df if hasattr(overlap, "df") else overlap
+            n_overlapping_mutations = overlap_df["_mut_row_id"].nunique()
+            return n_overlapping_mutations / max(len(mutation_df), 1)
         except Exception as e:
             logger.warning("Duon overlap failed: %s", e)
             return 0.0
@@ -612,22 +623,37 @@ class CRISPRDesigner:
     # ---------- Off-target search ----------
 
     def find_off_targets(self, guide: str,
-                         max_mismatches: int = 3) -> List[str]:
+                         max_mismatches: int = 3,
+                         exclude_locus: Optional[Tuple[str, int, int]] = None
+                         ) -> List[str]:
         """
         Search for off-target sites in the reference genome.
         Uses Bowtie if installed, otherwise performs brute-force approximate
         matching (only recommended for small genomes).
+
+        exclude_locus: (chrom, genomic_start, genomic_end) of the guide's own
+        on-target site, 0-based half-open, matching the coordinates returned
+        by design_grna. Bug fix (4): without this, the guide's own exact-match
+        location was always reported back as an "off-target" (0 mismatches
+        against itself), inflating every off-target count by at least 1.
         """
         if not guide or len(guide) != 20:
             return []
         if HAS_BOWTIE and self.ref_genome:
-            return self._bowtie_off_targets(guide, max_mismatches)
+            hits = self._bowtie_off_targets(guide, max_mismatches)
         elif self.genome_seq is not None:
-            return self._bruteforce_off_targets(guide, max_mismatches)
+            hits = self._bruteforce_off_targets(guide, max_mismatches)
         else:
             logger.warning(
                 "No reference genome or Bowtie available; skipping off-target search.")
             return []
+
+        if exclude_locus is not None:
+            ex_chrom, ex_start, ex_end = exclude_locus
+            # hits are formatted as "chrom:1-based_start-1-based_end"
+            excl_tag = f"{ex_chrom}:{ex_start + 1}-{ex_end}"
+            hits = [h for h in hits if h != excl_tag]
+        return hits
 
     def _bowtie_off_targets(self, guide: str, max_mm: int) -> List[str]:
         """Run Bowtie 1 to find off-targets (0-3 mismatches)."""
@@ -695,8 +721,12 @@ class CRISPRDesigner:
             if pam == "GG":
                 guide = window[i - 19:i + 1]
                 if len(guide) == 20 and "N" not in guide:
-                    score = self.score_grna(guide)
-                    off   = self.find_off_targets(guide, max_mismatches=3)
+                    g_start = start + i - 19
+                    g_end   = start + i
+                    score   = self.score_grna(guide)
+                    off     = self.find_off_targets(
+                        guide, max_mismatches=3,
+                        exclude_locus=(chrom, g_start, g_end))
                     candidates.append({
                         "guide":           guide,
                         "score":           score,
@@ -805,35 +835,70 @@ class EpigeneticDesigner:
         if self.duon_analyzer.duon_intervals is None:
             return []
 
+        duon_intervals = self.duon_analyzer.duon_intervals
+        # Bug fix (1): PyRanges has no `itergenome()` method (verified against
+        # both pyranges v0 and the pyranges1 rewrite) — calling it raised
+        # AttributeError and crashed this method on every real invocation.
+        # The portable way to get a plain row-iterable from a PyRanges object
+        # is via its underlying DataFrame.
+        duon_df = duon_intervals.df if hasattr(duon_intervals, "df") else duon_intervals
+
         # Load methylation data if available
         meth_status: Dict = {}
         if (methylation_bed and os.path.exists(methylation_bed)
                 and HAS_PYRANGES):
             try:
                 meth = pr.read_bed(methylation_bed)
-                for interval in meth:
-                    key = (interval.Chromosome, interval.Start, interval.End)
-                    meth_status[key] = (float(interval.Score)
-                                        if hasattr(interval, "Score") else 50.0)
+                meth_df = meth.df if hasattr(meth, "df") else meth
+                for _, interval in meth_df.iterrows():
+                    key = (interval["Chromosome"], interval["Start"], interval["End"])
+                    meth_status[key] = (float(interval["Score"])
+                                        if "Score" in interval and pd.notna(interval["Score"])
+                                        else 50.0)
             except Exception as e:
                 logger.warning("Failed to load methylation BED: %s", e)
 
+        # Bug fix (2): the original implementation re-scanned the *entire*
+        # mutation_df with a Python-level `iterrows()` for every single duon
+        # interval (O(n_mutations * n_duons)), which defeats the entire
+        # purpose of using PyRanges for "fast genomic interval overlap".
+        # We instead do a single vectorized PyRanges join once, then group
+        # the resulting overlaps by duon interval — O(n_mutations + n_duons)
+        # in practice (PyRanges' join itself is the optimized interval-tree
+        # step from the library).
+        mut_overlap_counts: Dict[Tuple, int] = defaultdict(int)
+        required = ["Chromosome", "Start_Position", "End_Position"]
+        if HAS_PYRANGES and all(c in mutation_df.columns for c in required) \
+                and not mutation_df.empty:
+            try:
+                mut_gr = pr.PyRanges(mutation_df.rename(columns={
+                    "Start_Position": "Start",
+                    "End_Position":   "End",
+                }))
+                joined = mut_gr.join(duon_intervals, how="inner")
+                joined_df = joined.df if hasattr(joined, "df") else joined
+                if len(joined_df) > 0:
+                    # join() suffixes the right-hand (duon) Start/End columns
+                    # to avoid collision with the left-hand mutation columns.
+                    start_col = "Start_b" if "Start_b" in joined_df.columns else "Start"
+                    end_col   = "End_b"   if "End_b"   in joined_df.columns else "End"
+                    grouped = joined_df.groupby(
+                        ["Chromosome", start_col, end_col]).size()
+                    for (chrom, start, end), count in grouped.items():
+                        mut_overlap_counts[(chrom, start, end)] = int(count)
+            except Exception as e:
+                logger.warning("Duon/mutation overlap join failed: %s", e)
+
         targets = []
-        for interval in self.duon_analyzer.duon_intervals.itergenome():
-            chrom = interval.Chromosome
-            start = interval.Start
-            end   = interval.End
+        for _, interval in duon_df.iterrows():
+            chrom = interval["Chromosome"]
+            start = interval["Start"]
+            end   = interval["End"]
 
-            mut_overlap = 0
-            for _, mut in mutation_df.iterrows():
-                if (mut.get("Chromosome") == chrom
-                        and "Start_Position" in mut
-                        and start <= mut["Start_Position"] <= end):
-                    mut_overlap += 1
-
-            freq      = mut_overlap / max(len(mutation_df), 1)
-            meth_key  = (chrom, start, end)
-            meth_level = meth_status.get(meth_key, 50.0)
+            mut_overlap = mut_overlap_counts.get((chrom, start, end), 0)
+            freq        = mut_overlap / max(len(mutation_df), 1)
+            meth_key    = (chrom, start, end)
+            meth_level  = meth_status.get(meth_key, 50.0)
 
             if freq > 0.1:
                 if meth_level > 70:
