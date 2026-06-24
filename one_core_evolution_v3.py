@@ -512,7 +512,7 @@ class CheckpointManager:
 # 10. LangevinEvolutionBridge
 # =============================================================================
 
-class LangevinEvolutionBridge:
+class LangevinEvolutionBridge(nn.Module):
     """
     Bridge connecting AdvancedStructuralLangevin (structural_langevin_evo_v3.py)
     to population-level dynamics in evolution_one_v3.py and
@@ -527,6 +527,14 @@ class LangevinEvolutionBridge:
     Mapping:
         μ = mean per-atom displacement / σ_scale → sigmoid squeeze to (0, 1)
 
+    Bug fix (June 2026): this class previously held its internal
+    SemanticStateContraction (an nn.Module) as a plain attribute on a
+    plain Python object. ``bridge.to(device)``, ``bridge.parameters()``,
+    and ``bridge.state_dict()`` would all silently no-op instead of
+    cascading into the SSC submodule. Subclassing nn.Module registers
+    ``self.ssc`` as a proper submodule, so those calls now work as any
+    caller would expect. All existing attributes/methods are unchanged.
+
     Args:
         langevin    : an AdvancedStructuralLangevin instance.
         sigma_scale : characteristic displacement scale for normalisation (Å).
@@ -539,6 +547,7 @@ class LangevinEvolutionBridge:
         sigma_scale: float = 1.0,
         ssc: Optional[SemanticStateContraction] = None,
     ) -> None:
+        super().__init__()
         self.langevin    = langevin
         self.sigma_scale = max(sigma_scale, 1e-8)
         self.ssc         = ssc or SemanticStateContraction(epsilon_fp=0.0028)
@@ -614,7 +623,7 @@ class LangevinEvolutionBridge:
 # 11. EpiEvolutionBridge  (Bug 7 fix)
 # =============================================================================
 
-class EpiEvolutionBridge:
+class EpiEvolutionBridge(nn.Module):
     """
     Bridge connecting EpiForecastEngine (epidemiological) and
     EvolutionONEEngine (cancer/genomic evolution).
@@ -626,6 +635,12 @@ class EpiEvolutionBridge:
     Coupling equations:
         Rt_coupled = Rt_base + scale · σ((μ_ssc − μ_threshold) · 10)
         μ_coupled  = μ_base  + scale · σ((Rt_ssc − Rt_threshold) · 5)
+
+    Bug fix (June 2026): this class previously held its two internal
+    SemanticStateContraction filters (_ssc_mu, _ssc_rt) as plain
+    attributes on a plain Python object, so ``.to(device)``,
+    ``.parameters()``, and ``.state_dict()`` would not reach them.
+    Subclassing nn.Module registers both as proper submodules.
 
     Args:
         mu_to_rt_scale  : max Rt increase attributable to mutation load.
@@ -643,6 +658,7 @@ class EpiEvolutionBridge:
         rt_threshold:    float = 1.5,
         epsilon_fp:      float = 0.0028,
     ) -> None:
+        super().__init__()
         self.mu_to_rt_scale = mu_to_rt_scale
         self.rt_to_mu_scale = rt_to_mu_scale
         self.mu_threshold   = mu_threshold
@@ -686,7 +702,7 @@ class EpiEvolutionBridge:
 # 12. CahnHilliardEvoBridge  (Fix 2 — new in v3)
 # =============================================================================
 
-class CahnHilliardEvoBridge:
+class CahnHilliardEvoBridge(nn.Module):
     """
     Bridge connecting structural_cahn_hilliard_3d.py (phase-field / CH3D)
     to the EVOLUTION ONE cluster (EvolutionONEEngine / EpiForecastEngine).
@@ -711,6 +727,12 @@ class CahnHilliardEvoBridge:
     Fully differentiable:
       • project_to_mu()  — gradients flow through u
       • phase_to_rt()    — gradients flow through u and rt_base
+
+    Bug fix (June 2026): this class previously held its internal
+    SemanticStateContraction as a plain attribute on a plain Python
+    object, invisible to ``.to(device)``, ``.parameters()``, and
+    ``.state_dict()``. Subclassing nn.Module registers ``self.ssc`` as
+    a proper submodule.
 
     Usage::
 
@@ -738,6 +760,7 @@ class CahnHilliardEvoBridge:
         mu_floor:         float = 1e-4,
         interface_weight: float = 0.2,
     ) -> None:
+        super().__init__()
         self.ch              = ch_solver
         self.ssc             = ssc or SemanticStateContraction(epsilon_fp=0.0028)
         self.mu_floor        = mu_floor
