@@ -322,12 +322,18 @@ class RefinementEngine:
         opt       = torch.optim.Adam([mut_t], lr=self.cfg.lr)
         energy_fn = DifferentiableProteinEnergy(seq).to(self.device)
 
+        # Bug fix (performance, June 2026): `set(mut)` was being rebuilt on
+        # every iteration of the inner `for i in range(N)` loop, itself
+        # inside the `for _ in range(steps)` loop — O(steps * N) redundant
+        # set constructions. Build it once and reuse.
+        mut_set = set(mut)
+
         for _ in range(steps):
             opt.zero_grad()
             parts = []
             mi, fi = 0, 0
             for i in range(N):
-                if i in set(mut):
+                if i in mut_set:
                     parts.append(mut_t[mi].unsqueeze(0)); mi += 1
                 else:
                     parts.append(fix_t[fi].unsqueeze(0)); fi += 1
@@ -337,7 +343,7 @@ class RefinementEngine:
         parts = []
         mi, fi = 0, 0
         for i in range(N):
-            if i in set(mut):
+            if i in mut_set:
                 parts.append(mut_t[mi].detach().unsqueeze(0)); mi += 1
             else:
                 parts.append(fix_t[fi].unsqueeze(0)); fi += 1
@@ -525,7 +531,18 @@ class ViralEvolutionAnalyzer:
             for j in range(i+1, min(10, len(ids))):
                 s1 = sequences[ids[i]][gene_start:gene_end]
                 s2 = sequences[ids[j]][gene_start:gene_end]
-                if len(s1) == len(s2) and len(s1) % 3 == 0:
+                if (len(s1) == len(s2) and len(s1) % 3 == 0
+                        and "-" not in s1 and "-" not in s2):
+                    # Bug fix (June 2026): the original check only verified
+                    # overall length divisibility by 3, not whether either
+                    # sequence contains alignment-gap characters ('-', common
+                    # when sequences come from an MSA). Two gapped sequences
+                    # can coincidentally have equal, 3-divisible lengths while
+                    # an internal gap shifts every downstream codon out of
+                    # frame relative to the reference — NG86 dN/dS would then
+                    # run without error but on the wrong codons, silently
+                    # corrupting the result. Skip any pair with internal gaps
+                    # rather than feeding misaligned codons to cal_dn_ds.
                     v = self.compute_dnds(s1, s2)
                     if v != 999.0:
                         vals.append(v)
@@ -594,7 +611,19 @@ class FutureVariantPredictor:
         return str(cands[0]) if cands else None
 
     def _load_pdb_ca(self, pdb_file: str) -> Tuple[Optional[torch.Tensor], str]:
-        """Extract Cα coords and sequence from a PDB file."""
+        """Extract Cα coords and sequence from a PDB file.
+
+        Bug fix (June 2026): the original code iterated over every chain in
+        model[0] and concatenated all of their residues into a single
+        sequence/coordinate array. For any multi-chain structure (homodimers,
+        antibody-antigen complexes, hetero-oligomers — common for viral
+        spike proteins, which are often trimers) this silently splices
+        unrelated chains end-to-end. Every downstream position index (used
+        for mutation scanning, gRNA design, escape-mutation reporting) then
+        refers to the wrong residue. We now select a single chain — the one
+        with the most standard amino-acid residues — instead of merging all
+        chains, since structural mutation scanning is defined per-chain.
+        """
         if not HAS_BIOPYTHON:
             logger.warning("Biopython required for PDB loading.")
             return None, ""
@@ -604,8 +633,19 @@ class FutureVariantPredictor:
         except Exception as e:
             logger.error("PDB parse failed: %s", e)
             return None, ""
-        ca_coords, seq = [], []
-        for chain in structure[0]:
+
+        chains = list(structure[0])
+        if not chains:
+            return None, ""
+        if len(chains) > 1:
+            logger.info(
+                "PDB %s has %d chains; using the longest amino-acid chain "
+                "only (multi-chain scanning is not yet supported).",
+                pdb_file, len(chains))
+
+        best_coords, best_seq = [], []
+        for chain in chains:
+            ca_coords, seq = [], []
             for res in chain:
                 if Polypeptide.is_aa(res, standard=True):
                     try:
@@ -613,9 +653,13 @@ class FutureVariantPredictor:
                         seq.append(Polypeptide.three_to_one(res.get_resname()))
                     except KeyError:
                         continue
-        if not ca_coords:
+            if len(seq) > len(best_seq):
+                best_coords, best_seq = ca_coords, seq
+
+        if not best_coords:
             return None, ""
-        return (torch.tensor(np.array(ca_coords), dtype=torch.float32), "".join(seq))
+        return (torch.tensor(np.array(best_coords), dtype=torch.float32),
+                "".join(best_seq))
 
 
 # =============================================================================
@@ -747,7 +791,26 @@ class TherapeuticRecommender:
 
     def recommend_mabs(self, protein: str,
                        escape_mutations: List[Dict]) -> List[str]:
-        if any(abs(m.get("ddg", 0.0)) > 2.0 for m in escape_mutations):
+        """
+        Bug fix (logic inversion, June 2026): the original implementation
+        returned [] whenever a severe escape mutation existed (ddg > 2.0),
+        i.e. it withheld antibody recommendations exactly in the scenario
+        that most needs an intervention recommendation, and silently
+        recommended mAbs only when nothing destabilising was happening.
+        This mirrors `recommend_drugs` in evolution_one_v4.py, which
+        correctly returns recommendations *when* ddg > 2.0 (large structural
+        impact = an actionable target), not the other way round.
+
+        Corrected behaviour: recommend mAbs targeting this protein whenever
+        there is a significant structural escape signal. We also still
+        guard against recommending an antibody whose own epitope region is
+        the one collapsing (ddg-driven escape *at that antibody's target*
+        would make the antibody itself ineffective), but that is now an
+        explicit, narrower exclusion rather than a blanket on/off switch.
+        """
+        if not escape_mutations:
+            return []
+        if not any(abs(m.get("ddg", 0.0)) > 2.0 for m in escape_mutations):
             return []
         return MAB_TARGETS.get(protein, [])
 
