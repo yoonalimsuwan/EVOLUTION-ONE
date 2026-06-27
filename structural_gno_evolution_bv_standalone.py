@@ -20,11 +20,18 @@
 #                             loss, periodic analytic certification,
 #                             StructuralGNOEvolutionBV, SGNOEvolutionBVTrainer,
 #                             two-stage graceful ImportError fallback chain,
-#                             this standalone single-file merge, AND the
+#                             this standalone single-file merge, the
 #                             Mode-4 cell-population coupling layer:
 #                             CellPopulationTrainingBridge, CellPopulationRollout,
 #                             the division-rate-matching training loss, and
-#                             the third stage of the graceful fallback chain.
+#                             the third stage of the graceful fallback chain;
+#                             AND (v1.2.0) the POP-2 sub-cellular extension:
+#                             OrganelleLayer/PhenotypeLayer attachment on the
+#                             cellpop bridge (requires cell_population_one
+#                             v1.1.0+, with its own graceful degradation
+#                             stage), organelle_health_and_boost,
+#                             loss_organelle_distillation, and the extended
+#                             CellPopulationRollout trace fields.
 #   - GPT      (OpenAI)     — early architecture exploration, message-passing
 #                             design, phase-field surrogate concept.
 #   - Gemini   (Google)     — v2 unified discrete/continuous extension,
@@ -39,9 +46,10 @@
 # CheckpointManager, SGNOEvolutionTrainer — Sections 0-9 below) is included
 # verbatim in this single file, followed by the BV-edition layer (Sections
 # 10-16) that extends it, plus a Mode-4 cell-population coupling layer
-# (Section 14.5) composed on top of both. No import of a separate
-# ``structural_gno_evolution`` module is required; this file is fully
-# self-contained.
+# (Sections 14.5-14.6 — POP-1 division-rate matching and POP-2 organelle
+# distillation respectively) composed on top of both. No import of a
+# separate ``structural_gno_evolution`` module is required; this file is
+# fully self-contained.
 #
 # StructuralGNOEvolutionBV is the BV-aware special edition of
 # StructuralGNOEvolution (SGNO-Evo). It keeps the entire production GNO
@@ -103,6 +111,28 @@
 #       logged as a diagnostic (``pop_mu_final``) but is never the loss term
 #       that actually moves the GNO's weights.
 #
+#   [POP-2] Organelle <-> GNO cross-modal distillation (sub-cellular, v1.2.0)
+#       Requires cell_population_one v1.1.0+ (the release that introduced
+#       OrganelleLayer/PhenotypeLayer). Identical composition pattern to
+#       BV-1, one rung further down the cross-cluster stack: instead of
+#       distilling CahnHilliardBVFull's analytic gauge theory, this term
+#       distills OrganelleLayer's own exact, parameter-free sub-cellular
+#       health signal (mitochondria/nucleus/lysosome/ER state, itself driven
+#       only by each cell's local CH3D sigma sample — see
+#       ``cell_population_one``'s Section 3.5) into the SAME Mode-1 ΔRt
+#       channel BV-1 already targets. Like BV-1, the target is detached
+#       before use (``CellPopulationTrainingBridge.organelle_health_and_boost``),
+#       so this is a one-directional self-distillation signal that trains
+#       only the Mode-1 head — it introduces no new trainable parameters and
+#       never back-propagates into OrganelleLayer's (parameter-free) ODEs.
+#       A PhenotypeLayer is additionally attached on top of the
+#       OrganelleLayer when ``enable_cellpop_phenotype=True`` (organelle
+#       health feeds its gene_drive every rollout step — see
+#       ``cell_population_one.organelle_drive_to_phenotype``); its final
+#       expression state is exposed as a diagnostic
+#       (``CellPopulationRollout.phenotype_expr_final``) but, as of v1.2.0,
+#       does not yet feed its own dedicated loss term.
+#
 # Parameter count
 # ----------------
 # StructuralGNOEvolutionBV adds ZERO new trainable parameters relative to
@@ -115,17 +145,22 @@
 #
 # Graceful degradation (still three-stage, even though single-file)
 # -------------------------------------------------------------------
+# Graceful degradation (still three-stage, even though single-file)
+# -------------------------------------------------------------------
 #   this file
 #     -> bv_full_theory_one            (BV-1, BV-3; optional, separate file)
 #         -> one_core_evolution        (required by bv_full_theory_one)
 #     -> cell_population_one          (Mode 4 / POP-1; optional, separate file)
+#         -> (v1.1.0+ of the same file) (POP-2 organelle distillation; the
+#                                        same file, just an older/newer
+#                                        version — NOT a separate import)
 #
 # If any link of either chain is missing, the corresponding feature(s)
 # disable themselves automatically (with a single warning) and
 # StructuralGNOEvolutionBV degrades to whatever subset remains available —
 # at minimum the plain production GNO surrogate plus BV-2 (which has no
 # external dependency). Training and inference never hard-fail because of
-# a missing optional module.
+# a missing optional module or an older cell_population_one version.
 #
 # Cost notes
 # ----------
@@ -151,7 +186,10 @@
 #   torch ≥ 2.1   (AMP, compile-ready)
 #   bv_full_theory_one   (optional — separate file, enables BV-1 / BV-3)
 #   one_core_evolution   (optional — required transitively by the line above)
-#   cell_population_one  (optional — separate file, enables Mode 4 / POP-1)
+#   cell_population_one  (optional — separate file, enables Mode 4 / POP-1;
+#                          v1.1.0+ additionally enables POP-2 organelle
+#                          distillation and PhenotypeLayer attachment — an
+#                          older v1.0.0 install still gets POP-1 but not POP-2)
 # =============================================================================
 
 from __future__ import annotations
@@ -1438,13 +1476,35 @@ try:
         CellPopulation,
         CellPopulationConfig,
         CellPopulationCahnHilliardBridge,
+        PhenotypeConfig,
+        PhenotypeLayer,
+        OrganelleConfig,
+        OrganelleLayer,
+        organelle_drive_to_phenotype,
         CELL_POPULATION_VERSION,
     )
     _HAS_CELL_POPULATION = True
-    logger.info("structural_gno_evolution_bv: cell_population_one v%s loaded.", CELL_POPULATION_VERSION)
+    # PhenotypeLayer / OrganelleLayer were introduced in cell_population_one
+    # v1.1.0 (the organelle layer) — v1.0.0 only exposes CellPopulation /
+    # CellPopulationConfig / CellPopulationCahnHilliardBridge. Detected here
+    # via a version-string comparison rather than a second nested try/except,
+    # since all of these names import successfully together as of v1.1.0+
+    # (no partial-import case to handle).
+    _CELLPOP_HAS_ORGANELLE = tuple(
+        int(x) for x in CELL_POPULATION_VERSION.split(".")[:2]
+    ) >= (1, 1)
+    logger.info(
+        "structural_gno_evolution_bv: cell_population_one v%s loaded "
+        "(organelle/phenotype layers %s).",
+        CELL_POPULATION_VERSION,
+        "available" if _CELLPOP_HAS_ORGANELLE else "unavailable — v1.1.0+ required",
+    )
 except ImportError as _cellpop_import_err:
     _HAS_CELL_POPULATION = False
+    _CELLPOP_HAS_ORGANELLE = False
     CellPopulation = CellPopulationConfig = CellPopulationCahnHilliardBridge = None  # type: ignore
+    PhenotypeConfig = PhenotypeLayer = OrganelleConfig = OrganelleLayer = None  # type: ignore
+    organelle_drive_to_phenotype = None  # type: ignore
     CELL_POPULATION_VERSION = "unavailable"
     logger.debug(
         "structural_gno_evolution_bv: cell_population_one not found (%s) — "
@@ -1466,10 +1526,11 @@ __all__ += [
     "CellPopulationRollout",
     "loss_population_clone_match",
     "loss_population_rate_match",
+    "loss_organelle_distillation",
     "CellPopulationTrainingBridge",
 ]
 
-SGNO_BV_VERSION: str = "1.1.0"
+SGNO_BV_VERSION: str = "1.2.0"
 
 
 # =============================================================================
@@ -1542,6 +1603,50 @@ class SGNOEvoBVConfig(SGNOEvoConfig):
                           rather than a synthetic anchor.
     pop_cert_every      : Log a population-rollout diagnostic (n_alive,
                           mutation load) every N optimiser steps (0 disables).
+
+    Sub-cellular layers (organelle / phenotype; requires
+    cell_population_one v1.1.0+; optional on top of Mode 4 itself)
+    --------------------------------------------------------------------
+    enable_cellpop_organelle : Master switch for attaching an OrganelleLayer
+                          (mitochondria/nucleus/lysosome/ER) to the bridge's
+                          CellPopulation. Requires both
+                          ``enable_cell_population=True`` and
+                          cell_population_one v1.1.0+ (the version that
+                          introduced OrganelleLayer); silently disables
+                          itself otherwise (with a single warning), same
+                          degradation convention as every other optional
+                          feature in this file.
+    enable_cellpop_phenotype : Master switch for attaching a PhenotypeLayer
+                          on top of the OrganelleLayer (organelle_health
+                          feeds PhenotypeLayer's gene_drive — see
+                          ``cell_population_one.organelle_drive_to_phenotype``).
+                          Only takes effect if ``enable_cellpop_organelle``
+                          is also true and available — a PhenotypeLayer with
+                          no OrganelleLayer beneath it would have nothing
+                          driving its gene_drive from this bridge, defeating
+                          the point of attaching it here specifically (a
+                          caller wanting a phenotype-only, organelle-free
+                          population should configure the bridge's
+                          CellPopulation directly rather than through this
+                          flag).
+    cellpop_phenotype_channels : channel_names for the attached
+                          PhenotypeLayer (passed straight through to
+                          ``PhenotypeConfig.channel_names``).
+    lambda_organelle_distill : Loss weight for the organelle-health <->
+                          GNO cross-modal distillation term (BV-style,
+                          see ``loss_organelle_distillation`` and
+                          ``CellPopulationTrainingBridge.organelle_health_and_boost``).
+                          Mirrors ``lambda_bv_distill``'s role exactly, one
+                          rung down the cross-cluster composition stack:
+                          BV-1 distills CahnHilliardBVFull's analytic gauge
+                          theory into Mode-1's ΔRt channel; this term
+                          distills OrganelleLayer's exact (parameter-free)
+                          sub-cellular health signal into the same channel,
+                          using the SAME certified-target, one-directional,
+                          non-backprop-through-the-analytic-engine pattern.
+    organelle_health_rt_scale : Max |Rt boost| magnitude the organelle
+                          distillation target can contribute — mirrors
+                          ``bv_rt_scale``'s role for the BV-1 pathway.
     """
 
     # BV bridge
@@ -1568,6 +1673,15 @@ class SGNOEvoBVConfig(SGNOEvoConfig):
     pop_target_division_rate: float = 0.05
     pop_cert_every:            int   = 100
 
+    # Sub-cellular layers (organelle / phenotype; cell_population_one v1.1.0+)
+    enable_cellpop_organelle:    bool  = True
+    enable_cellpop_phenotype:    bool  = True
+    cellpop_phenotype_channels:  Tuple[str, ...] = (
+        "proliferation", "stress_response", "differentiation",
+    )
+    lambda_organelle_distill:    float = 0.15
+    organelle_health_rt_scale:   float = 0.3
+
     def __post_init__(self) -> None:
         super().__post_init__()
         assert self.bv_kappa          > 0,  "bv_kappa must be positive"
@@ -1583,6 +1697,10 @@ class SGNOEvoBVConfig(SGNOEvoConfig):
         assert 0.0 < self.pop_target_division_rate < 1.0, \
             "pop_target_division_rate must be in (0, 1)"
         assert self.pop_cert_every      >= 0, "pop_cert_every must be ≥ 0"
+        assert len(self.cellpop_phenotype_channels) >= 1, \
+            "cellpop_phenotype_channels must be non-empty"
+        assert self.lambda_organelle_distill  >= 0, "lambda_organelle_distill must be ≥ 0"
+        assert self.organelle_health_rt_scale >= 0, "organelle_health_rt_scale must be ≥ 0"
 
 
 # =============================================================================
@@ -1887,6 +2005,14 @@ class CellPopulationRollout:
     see ``CellPopulation.step``. ``rate_trace`` below is built from those,
     and is the tensor Mode-4 training should actually use.
 
+    The same gradient-path caveat applies to every NEW field below this
+    line: ``OrganelleLayer``/``PhenotypeLayer`` state is updated from
+    ``local_sigma`` exactly the same differentiable way ``division_rate``
+    is (see ``cell_population_one.OrganelleLayer.update`` /
+    ``PhenotypeLayer.update``), so ``organelle_health_trace`` IS safe to
+    use in a training loss requiring gradients into ``pred_u`` — it is not
+    a population_mutation_load()-style discrete-state diagnostic.
+
     Attributes:
         n_alive_trace    : List[int], population size after each step.
         mu_trace         : (rollout_steps,) tensor, population_mutation_load()
@@ -1909,6 +2035,22 @@ class CellPopulationRollout:
                            see ``CellPopulation.clone_frequencies`` docstring).
         n_divided_total  : total divisions summed across the rollout.
         n_died_total     : total deaths summed across the rollout.
+        organelle_health_trace : (rollout_steps,) tensor, mean
+                           ``OrganelleLayer.organelle_health()`` over
+                           currently-alive cells at each step — ``None`` if
+                           no OrganelleLayer is attached for this rollout.
+                           Differentiable (see note above); this is the
+                           tensor ``loss_organelle_distillation`` consumes.
+        atp_trace        : (rollout_steps,) tensor, mean ``mito_atp`` over
+                           currently-alive cells at each step — diagnostic
+                           companion to ``organelle_health_trace`` for
+                           logging (e.g. detecting population-wide
+                           starvation collapse). ``None`` if no
+                           OrganelleLayer is attached.
+        phenotype_expr_final : (n_channels,) mean PhenotypeLayer expression
+                           over currently-alive cells at rollout end —
+                           diagnostic only. ``None`` if no PhenotypeLayer
+                           is attached.
     """
     n_alive_trace:     List[int]
     mu_trace:          torch.Tensor
@@ -1916,15 +2058,24 @@ class CellPopulationRollout:
     clone_freq_final:  torch.Tensor
     n_divided_total:   int
     n_died_total:      int
+    organelle_health_trace: Optional[torch.Tensor] = None
+    atp_trace:              Optional[torch.Tensor] = None
+    phenotype_expr_final:   Optional[torch.Tensor] = None
 
     def summary(self) -> str:
-        return (
+        base = (
             f"CellPopulationRollout  n_alive: {self.n_alive_trace[0]} -> "
             f"{self.n_alive_trace[-1]}  divided={self.n_divided_total}  "
             f"died={self.n_died_total}  "
             f"mean_division_rate_final={self.rate_trace[-1].item():.4f}  "
             f"mu_final={self.mu_trace[-1].item():.4f}"
         )
+        if self.organelle_health_trace is not None:
+            base += (
+                f"  organelle_health_final={self.organelle_health_trace[-1].item():.4f}"
+                f"  mean_atp_final={self.atp_trace[-1].item():.4f}"
+            )
+        return base
 
 
 def loss_population_clone_match(
@@ -1993,6 +2144,52 @@ def loss_population_rate_match(
     return F.mse_loss(rate_trace, target)
 
 
+# =============================================================================
+# 14.6  POP-2 — Organelle <-> GNO cross-modal distillation loss
+# =============================================================================
+
+def loss_organelle_distillation(
+    mu_rt_pred:           torch.Tensor,
+    organelle_boost_target: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Cross-modal organelle-health distillation loss (BV-1's sibling, one
+    rung down the cross-cluster composition stack).
+
+    Pulls the mean predicted ΔRt channel (Mode 1) toward the certified
+    structural-coupling boost implied by the attached CellPopulation's
+    OrganelleLayer health signal on the current rollout (see
+    ``CellPopulationTrainingBridge.organelle_health_and_boost``).
+
+    Exactly the same shape and one-directional-detached-target contract
+    as ``loss_bv_distillation``: ``organelle_boost_target`` carries no
+    gradient w.r.t. model parameters (built from a detached rollout
+    trace — see ``organelle_health_and_boost``), so this term only ever
+    trains the Mode-1 head, never the Mode-3/Mode-4 graph it is computed
+    from. Both this loss and ``loss_bv_distillation`` target the SAME
+    [Δμ, ΔRt] channel; if both are active simultaneously their two
+    targets are summed by the trainer before being applied (see
+    ``SGNOEvolutionBVTrainer.train_step``'s POP-2 section) — distinct from
+    OrganelleLayer's own internal fast/slow fitness pathways inside
+    ``cell_population_one`` itself, which this loss has no interaction
+    with whatsoever (this is a GNO-side distillation signal only; it does
+    not feed back into the CellPopulation's division/death logic).
+
+    Args:
+        mu_rt_pred             : (N, 2) predicted [Δμ, ΔRt] from the
+                                  evolution head (same tensor
+                                  ``loss_bv_distillation`` consumes).
+        organelle_boost_target  : scalar Tensor, the certified organelle
+                                  Rt boost.
+
+    Returns:
+        Scalar loss tensor.
+    """
+    rt_pred_mean = mu_rt_pred[:, 1].mean()
+    target = organelle_boost_target.to(device=rt_pred_mean.device, dtype=rt_pred_mean.dtype)
+    return F.mse_loss(rt_pred_mean, target)
+
+
 class CellPopulationTrainingBridge:
     """
     Composes a ``CellPopulation`` instance with the GNO's Mode-3 (ch3d)
@@ -2011,6 +2208,13 @@ class CellPopulationTrainingBridge:
                  device-mismatch-avoidance reason as ``BVCertificationBridge``
                  — CellPopulation's tensor ops are small relative to the GNO
                  backbone and grid_sample works identically on CPU.
+
+    Sub-cellular layers: ``self.organelle`` / ``self.phenotype`` mirror
+    ``self.population`` — set to the attached layer instance when enabled
+    and available, ``None`` otherwise. Every method on this bridge checks
+    these for ``None`` before use, so a caller can always inspect
+    ``bridge.organelle is not None`` rather than re-deriving availability
+    from config flags.
     """
 
     def __init__(self, cfg: SGNOEvoBVConfig, device: Optional[torch.device] = None) -> None:
@@ -2019,6 +2223,9 @@ class CellPopulationTrainingBridge:
         self.available = bool(cfg.enable_cell_population and _HAS_CELL_POPULATION)
 
         self.population: Optional["CellPopulation"] = None
+        self.organelle:  Optional["OrganelleLayer"]  = None
+        self.phenotype:  Optional["PhenotypeLayer"]  = None
+
         if self.available:
             pop_cfg = CellPopulationConfig(
                 n_max=cfg.cellpop_n_max,
@@ -2026,6 +2233,7 @@ class CellPopulationTrainingBridge:
                 device="cpu",
             )
             self.population = CellPopulation(pop_cfg)
+            self._attach_subcellular_layers()
         elif cfg.enable_cell_population and not _HAS_CELL_POPULATION:
             warnings.warn(
                 "SGNOEvoBVConfig.enable_cell_population=True but "
@@ -2036,15 +2244,78 @@ class CellPopulationTrainingBridge:
                 stacklevel=2,
             )
 
+    def _attach_subcellular_layers(self) -> None:
+        """
+        Attach OrganelleLayer and (optionally) PhenotypeLayer to
+        ``self.population``, honouring ``cfg.enable_cellpop_organelle`` /
+        ``cfg.enable_cellpop_phenotype`` and degrading gracefully if the
+        attached ``cell_population_one`` predates v1.1.0 (i.e. exposes
+        ``CellPopulation`` but not ``OrganelleLayer`` — see
+        ``_CELLPOP_HAS_ORGANELLE`` at the top of this file). Called once
+        from ``__init__``, only when ``self.population`` already exists.
+        """
+        cfg = self.cfg
+        if not cfg.enable_cellpop_organelle:
+            return
+        if not _CELLPOP_HAS_ORGANELLE:
+            warnings.warn(
+                "SGNOEvoBVConfig.enable_cellpop_organelle=True but the "
+                "attached cell_population_one is v%s (OrganelleLayer "
+                "requires v1.1.0+) — sub-cellular (organelle/phenotype) "
+                "training is disabled for this run; Mode-4's original "
+                "division/death-rate coupling remains fully active." % (
+                    CELL_POPULATION_VERSION,
+                ),
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
+
+        self.organelle = self.population.attach_organelle_layer(
+            OrganelleConfig(n_max=cfg.cellpop_n_max, device="cpu")
+        )
+
+        # PhenotypeLayer only makes sense here layered ON TOP of the
+        # OrganelleLayer just attached above (see SGNOEvoBVConfig's
+        # enable_cellpop_phenotype docstring for why) — if organelle
+        # attachment failed for any reason above, self.organelle would
+        # already be None and this branch is simply skipped.
+        if cfg.enable_cellpop_phenotype:
+            self.phenotype = self.population.attach_phenotype_layer(
+                PhenotypeConfig(
+                    n_max=cfg.cellpop_n_max,
+                    channel_names=cfg.cellpop_phenotype_channels,
+                    device="cpu",
+                )
+            )
+
     def set_genotype_fitness(self, fitness: torch.Tensor) -> None:
         """Forward to ``CellPopulation.set_genotype_fitness`` if available."""
         if self.available and self.population is not None:
             self.population.set_genotype_fitness(fitness)
 
     def reset_population(self, seed: Optional[int] = None) -> None:
-        """Re-spawn the underlying population (e.g. at the start of every epoch)."""
+        """
+        Re-spawn the underlying population (e.g. at the start of every
+        epoch), and reset any attached sub-cellular layers to baseline.
+
+        Note: ``CellPopulation.reset()`` itself only re-spawns
+        ``self.state`` (positions/genotypes/alive) — it does NOT cascade
+        to attached ``OrganelleLayer``/``PhenotypeLayer`` instances (as of
+        cell_population_one v1.1.0, neither layer is reset by the base
+        population's ``reset()``). This method explicitly resets both
+        here so a bridge-level ``reset_population()`` call genuinely
+        starts a fresh epoch end-to-end, rather than leaving stale
+        organelle/phenotype state (e.g. accumulated DNA damage or ROS
+        from the previous epoch's rollout) silently attached to
+        freshly-respawned cells.
+        """
         if self.available and self.population is not None:
             self.population.reset(seed=seed)
+            if self.organelle is not None:
+                self.organelle.reset()
+            if self.phenotype is not None:
+                self.phenotype.reset()
 
     def rollout(
         self,
@@ -2090,6 +2361,8 @@ class CellPopulationTrainingBridge:
         n_alive_trace: List[int] = []
         mu_steps: List[torch.Tensor] = []
         rate_steps: List[torch.Tensor] = []
+        organelle_health_steps: List[torch.Tensor] = []
+        atp_steps: List[torch.Tensor] = []
         n_divided_total = 0
         n_died_total = 0
 
@@ -2110,9 +2383,33 @@ class CellPopulationTrainingBridge:
             n_alive_f = alive_f.sum().clamp_min(1.0)
             rate_steps.append((div_rate * alive_f).sum() / n_alive_f)
 
+            # Organelle health: same alive-weighted-mean pattern as
+            # division_rate above, over OrganelleState.organelle_health()
+            # (a per-cell scalar, fully differentiable w.r.t. local_sigma —
+            # see CellPopulationRollout's docstring gradient-path note).
+            if self.organelle is not None:
+                health = self.organelle.organelle_health()
+                organelle_health_steps.append((health * alive_f).sum() / n_alive_f)
+                atp = self.organelle.state.mito_atp
+                atp_steps.append((atp * alive_f).sum() / n_alive_f)
+
         mu_trace   = torch.stack(mu_steps)
         rate_trace = torch.stack(rate_steps)
         clone_freq_final = self.population.clone_frequencies()
+
+        organelle_health_trace: Optional[torch.Tensor] = None
+        atp_trace: Optional[torch.Tensor] = None
+        if self.organelle is not None:
+            organelle_health_trace = torch.stack(organelle_health_steps)
+            atp_trace = torch.stack(atp_steps)
+
+        phenotype_expr_final: Optional[torch.Tensor] = None
+        if self.phenotype is not None:
+            alive_final = self.population.state.alive.to(self.phenotype.state.expression.dtype)
+            n_alive_final = alive_final.sum().clamp_min(1.0)
+            phenotype_expr_final = (
+                self.phenotype.state.expression * alive_final.unsqueeze(-1)
+            ).sum(dim=0) / n_alive_final
 
         return CellPopulationRollout(
             n_alive_trace=n_alive_trace,
@@ -2121,7 +2418,56 @@ class CellPopulationTrainingBridge:
             clone_freq_final=clone_freq_final,
             n_divided_total=n_divided_total,
             n_died_total=n_died_total,
+            organelle_health_trace=organelle_health_trace,
+            atp_trace=atp_trace,
+            phenotype_expr_final=phenotype_expr_final,
         )
+
+    def organelle_health_and_boost(
+        self, rollout: CellPopulationRollout,
+    ) -> Optional[torch.Tensor]:
+        """
+        Map a completed rollout's ``organelle_health_trace`` to a certified
+        ``organelle_boost`` scalar, for use as
+        ``loss_organelle_distillation``'s detached target — the Mode-4
+        analogue of ``BVCertificationBridge.mu_bv_and_boost``.
+
+        Unlike the BV bridge's ``mu_bv_and_boost`` (which re-derives its
+        target from an EXACT, parameter-free analytic gauge theory in
+        ``bv_full_theory_one``), this method's "certified" signal is
+        ``OrganelleLayer``'s own health trace — itself parameter-free
+        (no learned weights anywhere in ``cell_population_one``'s
+        organelle ODEs) and computed purely from each cell's local CH3D
+        sigma sample, so it is an equally legitimate exact/analytic target
+        for distillation despite the different source module. The boost
+        is built by:
+          1. Taking the rollout-final organelle_health_trace value (a
+             rough [-1, 1]-ish scalar — see
+             ``OrganelleLayer.organelle_health``'s docstring).
+          2. Detaching it (mirrors ``BVSpectrum.set_field``'s internal
+             detach for the BV-1 pathway exactly — this is a
+             ONE-DIRECTIONAL self-distillation signal; gradients must
+             never flow from this target back through the rollout into
+             the GNO's Mode-3/Mode-4 graph a second time, since
+             ``loss_organelle_distillation`` only trains the Mode-1 head).
+          3. Scaling by ``cfg.organelle_health_rt_scale`` and squashing
+             through ``tanh`` so the resulting boost stays bounded
+             regardless of how extreme ``organelle_health`` becomes (the
+             same bounded-target convention ``CahnHilliardBVBridge.bv_to_rt``
+             already uses for BV-1's boost).
+
+        Args:
+            rollout : a ``CellPopulationRollout`` from ``self.rollout()``.
+                      If ``rollout.organelle_health_trace`` is ``None``
+                      (no OrganelleLayer attached), returns ``None``.
+
+        Returns:
+            Scalar CPU Tensor (detached), or ``None``.
+        """
+        if rollout.organelle_health_trace is None:
+            return None
+        health_final = rollout.organelle_health_trace[-1].detach()
+        return torch.tanh(health_final * self.cfg.organelle_health_rt_scale)
 
 
 # =============================================================================
@@ -2140,7 +2486,13 @@ class StructuralGNOEvolutionBV(StructuralGNOEvolution):
         inference-time inspection or downstream use.
       • ``self.cellpop_bridge`` — a ``CellPopulationTrainingBridge`` exposing
         Mode 4 (cell-population) rollouts driven by this model's Mode-3
-        predictions (see ``SGNOEvolutionBVTrainer._compute_losses``).
+        predictions (see ``SGNOEvolutionBVTrainer._compute_losses``). As of
+        ``cell_population_one`` v1.1.0+, this bridge also attaches an
+        ``OrganelleLayer`` (and, on top of it, a ``PhenotypeLayer``) to its
+        ``CellPopulation`` — accessible as ``self.cellpop_bridge.organelle``
+        / ``self.cellpop_bridge.phenotype`` — enabling the POP-2 organelle
+        distillation term (``lambda_organelle_distill``) on top of Mode-4's
+        original division-rate matching term.
 
     Args:
         cfg : SGNOEvoBVConfig instance.
@@ -2197,7 +2549,7 @@ class SGNOEvolutionBVTrainer(SGNOEvolutionTrainer):
     """
     Trainer for StructuralGNOEvolutionBV.
 
-    Extends ``SGNOEvolutionTrainer`` with four additions, all individually
+    Extends ``SGNOEvolutionTrainer`` with five additions, all individually
     weighted / toggle-able via ``SGNOEvoBVConfig``:
 
       • BV-2 mass conservation on every Mode-3 batch (``lambda_bv_mass``).
@@ -2214,6 +2566,16 @@ class SGNOEvolutionBVTrainer(SGNOEvolutionTrainer):
         ``pop_n_divided``, ``pop_n_died``, ``pop_mu_final``) are logged
         every step; a fuller rollout summary is logged every
         ``pop_cert_every`` steps (see ``train_step``).
+      • POP-2 — organelle distillation: when the cellpop bridge has an
+        OrganelleLayer attached (``enable_cellpop_organelle``) AND a
+        Mode-1 batch is present this step, additionally distills the
+        rollout's final ``organelle_health`` into the same Mode-1 ΔRt
+        channel BV-1 already targets (``lambda_organelle_distill``) — see
+        ``loss_organelle_distillation``. Logged as
+        ``loss_organelle_distill`` / ``organelle_health_final`` /
+        ``organelle_atp_final`` whenever it runs; included in the
+        ``pop_cert_every`` summary line alongside the Mode-4 diagnostics
+        above.
 
     All base-trainer behaviour (AMP, EMA, gradient clipping, NaN guards,
     LR scheduling, checkpointing, early stopping) is unchanged.
@@ -2356,6 +2718,26 @@ class SGNOEvolutionBVTrainer(SGNOEvolutionTrainer):
                     log["pop_n_died"]     = float(rollout.n_died_total)
                     log["pop_mu_final"]   = rollout.mu_trace[-1].item()
 
+                    # POP-2 : organelle <-> GNO cross-modal distillation —
+                    # same composition pattern as BV-1 above (reuses
+                    # out_evo / pred_u, requires a Mode-1 batch and the
+                    # bridge's OrganelleLayer to both be available this
+                    # step). See loss_organelle_distillation's docstring
+                    # for why this is a legitimate distillation target
+                    # despite organelle_health not coming from
+                    # bv_full_theory_one specifically.
+                    if out_evo is not None and rollout.organelle_health_trace is not None:
+                        organelle_boost = self.model.cellpop_bridge.organelle_health_and_boost(rollout)
+                        if organelle_boost is not None:
+                            loss_organelle = loss_organelle_distillation(
+                                out_evo["mu_rt"], organelle_boost,
+                            )
+                            l_organelle = cfg.lambda_organelle_distill * loss_organelle.to(pred_u.device)
+                            total_loss  = total_loss + l_organelle
+                            log["loss_organelle_distill"] = l_organelle.item()
+                            log["organelle_health_final"] = rollout.organelle_health_trace[-1].item()
+                            log["organelle_atp_final"]    = rollout.atp_trace[-1].item()
+
         log["total_loss"] = total_loss.item()
         return total_loss, log
 
@@ -2405,21 +2787,26 @@ class SGNOEvolutionBVTrainer(SGNOEvolutionTrainer):
         ):
             pop = self.model.cellpop_bridge.population
             if pop is not None:
+                organelle_msg = ""
+                if self.model.cellpop_bridge.organelle is not None:
+                    organelle_msg = (
+                        f"  organelle_health_final=%.4f  organelle_atp_final=%.4f" % (
+                            log.get("organelle_health_final", float("nan")),
+                            log.get("organelle_atp_final", float("nan")),
+                        )
+                    )
                 logger.info(
                     "Step %6d | Mode-4 population: n_alive=%d  "
-                    "loss_pop_rate=%.4f  pop_mu_final=%.4f",
+                    "loss_pop_rate=%.4f  pop_mu_final=%.4f%s",
                     self.global_step, pop.state.n_alive(),
                     log.get("loss_pop_rate", float("nan")),
                     log.get("pop_mu_final", float("nan")),
+                    organelle_msg,
                 )
 
         return log
 
 
-
-# =============================================================================
-# 8.  Quick Smoke-Test  (python structural_gno_evolution_bv.py)
-# =============================================================================
 
 # =============================================================================
 # 17.  Quick Smoke-Test  (python structural_gno_evolution_bv_standalone.py)
@@ -2449,6 +2836,8 @@ if __name__ == "__main__":
     print(f"  params : {model.num_parameters():,}")
     print(f"  bv_bridge.available : {model.bv_bridge.available}")
     print(f"  cellpop_bridge.available : {model.cellpop_bridge.available}")
+    print(f"  cellpop_bridge.organelle attached : {model.cellpop_bridge.organelle is not None}")
+    print(f"  cellpop_bridge.phenotype attached : {model.cellpop_bridge.phenotype is not None}")
 
     # ── Synthetic batch helpers ──────────────────────────────────────
     N, E, Nx = 12, 24, 4
@@ -2508,7 +2897,9 @@ if __name__ == "__main__":
           f"loss_bv_distill={log.get('loss_bv_distill', float('nan')):.4f}  "
           f"loss_pop_rate={log.get('loss_pop_rate', float('nan')):.4f}  "
           f"pop_n_alive={log.get('pop_n_alive', float('nan')):.0f}  "
-          f"pop_mu_final={log.get('pop_mu_final', float('nan')):.4f}")
+          f"pop_mu_final={log.get('pop_mu_final', float('nan')):.4f}  "
+          f"loss_organelle_distill={log.get('loss_organelle_distill', float('nan')):.4f}  "
+          f"organelle_health_final={log.get('organelle_health_final', float('nan')):.4f}")
 
     # ── Mode-4 gradient-flow verification: pred_u -> rate_trace must carry
     #    a real gradient back into the GNO's ch3d_head, since this is the
@@ -2528,6 +2919,60 @@ if __name__ == "__main__":
         model.zero_grad(set_to_none=True)
     else:
         print("  [SKIP] Mode-4 gradient-flow check (cell_population_one unavailable)")
+
+    # ── Organelle-layer gradient-flow + distillation checks (requires
+    #    cell_population_one v1.1.0+) ────────────────────────────────────
+    if model.cellpop_bridge.organelle is not None:
+        # (a) organelle_health_trace -> ch3d_head gradient flow, same
+        # pattern as the Mode-4 rate_trace check above.
+        model.zero_grad(set_to_none=True)
+        out_ch_probe2 = model(batch_ch, mode="ch3d")
+        rollout_org = model.cellpop_bridge.rollout(out_ch_probe2["pred_u"], hard=True)
+        assert rollout_org.organelle_health_trace is not None
+        rollout_org.organelle_health_trace.sum().backward()
+        organelle_grad_norm = sum(
+            p.grad.norm().item() for p in model.ch3d_head.parameters() if p.grad is not None
+        )
+        print(f"  Organelle gradient-flow check  organelle_health_trace -> ch3d_head  "
+              f"grad_norm={organelle_grad_norm:.6f}  -> "
+              f"{'[PASS] gradient reaches GNO weights' if organelle_grad_norm > 0.0 else '[FAIL] zero gradient'}")
+        model.zero_grad(set_to_none=True)
+
+        # (b) organelle_health_and_boost produces a detached, bounded scalar.
+        boost = model.cellpop_bridge.organelle_health_and_boost(rollout_org)
+        boost_ok = (
+            boost is not None and not boost.requires_grad
+            and abs(boost.item()) <= cfg.organelle_health_rt_scale + 1e-6
+        )
+        print(f"  organelle_health_and_boost  value={boost.item() if boost is not None else float('nan'):.4f}  "
+              f"detached={boost is not None and not boost.requires_grad}  -> "
+              f"{'[PASS] bounded, detached distillation target' if boost_ok else '[FAIL]'}")
+
+        # (c) loss_organelle_distillation actually trains Mode-1's head and
+        # nothing else (same one-directional contract as loss_bv_distillation).
+        with torch.no_grad():
+            out_evo_probe = model(batch_evo, mode="evolution")
+        mu_rt_leaf = out_evo_probe["mu_rt"].detach().clone().requires_grad_(True)
+        loss_probe = loss_organelle_distillation(mu_rt_leaf, boost)
+        loss_probe.backward()
+        print(f"  loss_organelle_distillation  loss={loss_probe.item():.4f}  "
+              f"grad_reaches_mu_rt={mu_rt_leaf.grad is not None and mu_rt_leaf.grad.norm().item() > 0.0} -> "
+              f"{'[PASS]' if mu_rt_leaf.grad is not None else '[FAIL]'}")
+
+        # (d) phenotype, if attached, has a finite, non-degenerate final state.
+        if model.cellpop_bridge.phenotype is not None:
+            expr_final = rollout_org.phenotype_expr_final
+            phen_ok = expr_final is not None and torch.isfinite(expr_final).all()
+            print(f"  phenotype_expr_final  shape={tuple(expr_final.shape) if expr_final is not None else None}  "
+                  f"finite={phen_ok} -> {'[PASS]' if phen_ok else '[FAIL]'}")
+        else:
+            print("  [SKIP] phenotype_expr_final check (PhenotypeLayer not attached)")
+    else:
+        print(
+            "  [SKIP] Organelle gradient-flow / distillation checks "
+            f"(OrganelleLayer unavailable — cell_population_one v{CELL_POPULATION_VERSION}, "
+            "v1.1.0+ required, or enable_cellpop_organelle=False)"
+        )
 
     # ── forward_certified ────────────────────────────────────────────
     model.eval()
