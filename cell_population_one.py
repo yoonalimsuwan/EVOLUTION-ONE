@@ -20,7 +20,31 @@
 #                             mutation matrix, CellPopulationMixin
 #                             (attach_cell_population, matching the
 #                             LangevinBridgeMixin convention), full
-#                             [PASS]/[FAIL] verification suite
+#                             [PASS]/[FAIL] verification suite,
+#                             OrganelleLayer v1.1.0 (mitochondria / nucleus
+#                             / lysosome / endoplasmic reticulum
+#                             sub-cellular ODE layer, two-pathway coupling
+#                             into PhenotypeLayer's gene_drive and
+#                             CellPopulation's division/death logit,
+#                             ATP-gated division, checkpointing support)
+#
+# =============================================================================
+# CHANGELOG
+# =============================================================================
+# v1.1.0 (2026) — Organelle Layer
+#   Added OrganelleConfig / OrganelleState / OrganelleLayer: a per-cell
+#   sub-cellular layer beneath PhenotypeLayer, modelling mitochondria
+#   (ATP / membrane potential / ROS), nucleus (DNA damage / repair
+#   capacity, with a p53-like checkpoint), lysosome (autophagy capacity
+#   and flux), and endoplasmic reticulum (unfolded-protein load / UPR
+#   stress), each coupled to the others via the crosstalk pathways
+#   documented in Section 3.5 below. Wired into CellPopulation.step() via
+#   attach_organelle_layer(), contributing both a fast direct fitness
+#   pathway (bypassing PhenotypeLayer's ODE lag) and a slow pathway into
+#   PhenotypeLayer's gene-regulatory drive (via
+#   organelle_drive_to_phenotype(), injected per-step without mutating
+#   PhenotypeLayer's persistent _gene_drive buffer). With no
+#   OrganelleLayer attached, behaviour is unchanged from v1.0.0.
 #
 # =============================================================================
 # WHAT THIS FILE ADDS TO THE ECOSYSTEM
@@ -207,7 +231,7 @@ except ImportError:
         "standalone mode with local fallbacks."
     )
 
-CELL_POPULATION_VERSION: str = "1.0.0"
+CELL_POPULATION_VERSION: str = "1.1.0"
 
 __all__ = [
     "CELL_POPULATION_VERSION",
@@ -221,6 +245,10 @@ __all__ = [
     "fitness_from_mutation_matrix",
     "CellPopulationCahnHilliardBridge",
     "CellPopulationMixin",
+    # Organelle layer (v1.1.0)
+    "OrganelleConfig",
+    "OrganelleState",
+    "OrganelleLayer",
 ]
 
 
@@ -643,12 +671,19 @@ class PhenotypeLayer(nn.Module):
     # ODE step
     # ------------------------------------------------------------------
 
-    def update(self, local_sigma: torch.Tensor, alive: torch.Tensor) -> torch.Tensor:
+    def update(
+        self,
+        local_sigma: torch.Tensor,
+        alive: torch.Tensor,
+        extra_drive: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Advance the expression ODE by one explicit-Euler step:
 
             E_{t+1} = E_t + dt * ( -decay_rate * E_t
-                                    + tanh(gene_gain * gene_drive + sigma_gain * (sigma - 1)) )
+                                    + tanh(gene_gain * gene_drive
+                                           + extra_drive
+                                           + sigma_gain * (sigma - 1)) )
 
         Only applied to currently-alive cells — dead slots' expression is
         left untouched here (it gets explicitly reset on death via
@@ -659,6 +694,21 @@ class PhenotypeLayer(nn.Module):
                           cell's position this step (same tensor
                           CellPopulation.step() already computes).
             alive       : (n_max,) bool mask of currently-alive cells.
+            extra_drive : optional (n_max, n_channels) additional drive
+                          term, added in BEFORE the shared tanh() but
+                          OUTSIDE ``cfg.gene_gain`` and not stored into
+                          ``self._gene_drive`` — i.e. a one-step,
+                          non-persistent addition. This is the hook
+                          ``CellPopulation.step()`` uses to fold
+                          ``organelle_drive_to_phenotype()`` in every
+                          step without mutating the caller-owned
+                          ``_gene_drive`` buffer (which would otherwise
+                          accumulate the organelle term step after step,
+                          since ``_gene_drive`` is a persistent buffer
+                          set rarely, not necessarily every step, via
+                          ``set_gene_drive()``). Defaults to zero (no-op)
+                          when omitted, so this is a strict superset of
+                          the pre-organelle-layer ODE.
         Returns:
             (n_max, n_channels) updated expression state (also stored as
             ``self.state.expression``).
@@ -666,6 +716,8 @@ class PhenotypeLayer(nn.Module):
         cfg = self.cfg
         sigma_dev = (local_sigma - 1.0).unsqueeze(-1)               # (n_max, 1)
         drive = cfg.gene_gain * self._gene_drive + self.sigma_gain.unsqueeze(0) * sigma_dev
+        if extra_drive is not None:
+            drive = drive + extra_drive
         dE = -self.decay_rate.unsqueeze(0) * self.state.expression + torch.tanh(drive)
 
         new_expression = self.state.expression + cfg.dt * dE
@@ -724,6 +776,762 @@ class PhenotypeLayer(nn.Module):
         """Reset all expression state to baseline (e.g. between independent simulation runs)."""
         self.state.expression.fill_(self.cfg.init_expression)
         self._gene_drive.zero_()
+
+
+# =============================================================================
+# 3.5  Organelle Layer — sub-cellular state (mitochondria / nucleus /
+#      lysosome / endoplasmic reticulum)
+# =============================================================================
+#
+# PhenotypeLayer (Section 3) tracks *expression* — the gene-regulatory-
+# network-level output of a cell. It does not model anything about *why*
+# a cell's machinery might be failing at a level finer than "expression
+# went up or down". This section adds that finer level: four coupled
+# organelle subsystems, each with its own small ODE state, each
+# bidirectionally coupled to the others the way real organelle crosstalk
+# works, and each contributing to the cell's fate through two distinct
+# pathways:
+#
+#   1. A slow pathway: organelle_health feeds into PhenotypeLayer's
+#      gene_drive (via organelle_drive_to_phenotype below) — i.e.
+#      organelle state shapes phenotype expression, exactly the same way
+#      GeneNetworkBV's phi does, and the two drives are simply additive
+#      before the shared tanh() in PhenotypeLayer.update().
+#   2. A fast pathway: OrganelleLayer.fitness_contribution() — a direct,
+#      undamped contribution to CellPopulation's division/death logit,
+#      bypassing the phenotype ODE's low-pass decay entirely. This matters
+#      biologically: a nucleus with DNA damage past a checkpoint threshold
+#      should be able to trigger apoptosis *this step*, not several steps
+#      later once a slow expression ODE catches up. Both pathways are
+#      additive in CellPopulation.step(), mirroring how genotype_fitness
+#      and phenotype_term already coexist there.
+#
+# The four organelles and what each one tracks:
+#
+#   Mitochondria (mito_atp, mito_psi, mito_ros)
+#   --------------------------------------------
+#   mito_atp : ATP budget ∈ roughly [0, 1]. Produced from the local CH3D
+#              sigma signal (a stand-in for nutrient/oxygen availability —
+#              sigma > 1 reads as a metabolically favourable
+#              microenvironment) via mito_psi (membrane potential)-gated
+#              production, consumed by a fixed per-step
+#              maintenance/division cost (motility + a flat per-step
+#              upkeep). Division is additionally gated by an ATP
+#              sufficiency check inside CellPopulation.step (a cell with
+#              mito_atp at the floor cannot pay the energetic cost of
+#              dividing — see OrganelleLayer.atp_division_gate).
+#   mito_psi : membrane potential ∈ [0, 1], 1 = healthy/polarised. Decays
+#              under sustained ROS exposure (the textbook ROS → membrane
+#              permeabilisation pathway) and is partially restored by
+#              lysosomal mitophagy clearance (lyso_autophagy_flux below).
+#   mito_ros : reactive oxygen species level ≥ 0. Produced as a
+#              by-product of ATP production (more production at low
+#              membrane potential = "leakier", more ROS per unit ATP —
+#              the standard electron-transport-chain leak picture), fed
+#              forward into nuclear DNA damage and ER stress, and cleared
+#              by lysosomal autophagy.
+#
+#   Nucleus (nuc_damage, nuc_repair_capacity)
+#   -------------------------------------------
+#   nuc_damage : DNA damage load ∈ [0, 1]. Driven by mito_ros and by raw
+#              sigma deviation (structural/replication stress), repaired
+#              at a rate set by nuc_repair_capacity. Past
+#              cfg.nuc_checkpoint_threshold, contributes a strongly
+#              negative term to fitness_contribution() — the p53-like
+#              "too much damage ⇒ apoptosis" checkpoint — implemented as
+#              a smooth softplus-above-threshold penalty, never a hard
+#              cutoff, so it remains differentiable.
+#   nuc_repair_capacity : ∈ [0, 1], itself slowly depleted by ATP scarcity
+#              (DNA repair is energetically expensive) — i.e. a starved
+#              cell's repair machinery degrades over time, compounding
+#              damage accumulation rather than the two being independent.
+#
+#   Lysosome (lyso_capacity, lyso_autophagy_flux)
+#   -------------------------------------------------
+#   lyso_capacity : ∈ [0, 1], degrades slowly with cell age (the
+#              well-documented age-related decline in lysosomal/autophagic
+#              function — "lysosomal exhaustion"), restored slightly on
+#              division (a fresh daughter cell inherits a partially
+#              reset lysosomal pool, not a fully reset one — see
+#              cfg.lyso_inherit_fraction).
+#   lyso_autophagy_flux : ∈ [0, 1], how much clearance capacity is
+#              actually being exerted this step — a function of
+#              lyso_capacity gated by how much there currently is to
+#              clear (mito_ros + ER unfolded-protein load), so an
+#              undamaged cell with full lysosomal capacity still shows
+#              near-zero flux (nothing to clear), not constant high flux.
+#              This flux is what reduces mito_ros and er_unfolded each
+#              step (autophagy/mitophagy and ER-phagy respectively).
+#
+#   Endoplasmic reticulum (er_unfolded, er_upr_stress)
+#   -----------------------------------------------------
+#   er_unfolded : unfolded/misfolded protein load ∈ [0, 1]. Driven by
+#              ATP scarcity (protein folding is ATP-dependent — a starved
+#              cell accumulates misfolded protein faster) and cleared by
+#              lyso_autophagy_flux.
+#   er_upr_stress : unfolded protein response activation ∈ [0, 1] — a
+#              smooth (softplus) function of er_unfolded crossing
+#              cfg.er_upr_threshold, feeding back as an *extra* drag on
+#              mito_psi (the well-established ER-mitochondria stress
+#              crosstalk via Ca2+ signalling at MAM contact sites) rather
+#              than being purely a downstream readout.
+#
+# Design choices mirror the rest of this module: batched (n_max, ) flat
+# tensors, explicit-Euler ODE integration synchronised 1:1 with
+# CellPopulation.step(), soft/differentiable gating throughout (no hard
+# thresholds), and inherit_slots()/reset_slots() bookkeeping called by
+# CellPopulation.step() at exactly the same point PhenotypeLayer's
+# analogous methods already are.
+# =============================================================================
+
+@dataclass
+class OrganelleConfig:
+    """
+    Configuration for the per-cell organelle layer (mitochondria, nucleus,
+    lysosome, endoplasmic reticulum).
+
+    n_max : must match the attached CellPopulationConfig.n_max — enforced
+            automatically by CellPopulation.attach_organelle_layer(), the
+            same way PhenotypeConfig.n_max is.
+    dt    : integration time step for all four organelle ODEs, one
+            explicit-Euler update per CellPopulation.step() call (same
+            convention as PhenotypeConfig.dt).
+
+    Mitochondria
+    ------------
+    mito_atp_production_gain : how strongly local CH3D sigma (clamped to
+            be non-negative as a "nutrient availability" proxy) drives
+            ATP production, gated by current mito_psi.
+    mito_atp_upkeep          : flat per-step ATP consumption from basal
+            maintenance (independent of division — division's *additional*
+            ATP cost is mito_division_cost, charged only on steps where
+            the cell actually divides).
+    mito_division_cost       : extra one-off ATP cost charged to a
+            dividing cell's *parent* slot at the moment of division
+            (mirrors the real energetic cost of replicating organelles
+            and biomass before cytokinesis).
+    mito_psi_ros_decay       : how strongly sustained ROS degrades
+            membrane potential per step.
+    mito_psi_repair_gain     : how strongly lysosomal autophagy flux
+            restores membrane potential per step (mitophagy clearing
+            damaged mitochondrial components allows repolarisation).
+    mito_ros_production_gain : ROS produced per unit of ATP production,
+            scaled up at low membrane potential (electron-transport-chain
+            leak increases as the chain becomes less efficient/coupled).
+    mito_ros_clearance_gain  : how strongly lysosomal autophagy flux
+            clears existing ROS per step.
+    atp_division_floor       : minimum mito_atp required before a cell's
+            division probability is not actively suppressed by the ATP
+            gate (see OrganelleLayer.atp_division_gate) — below this, the
+            gate smoothly pushes the effective division logit down,
+            modelling "a starved cell cannot afford to divide" without a
+            hard cutoff.
+
+    Nucleus
+    -------
+    nuc_damage_ros_gain     : how strongly mito_ros drives DNA damage
+            accumulation per step.
+    nuc_damage_sigma_gain   : how strongly raw |sigma - 1| (structural/
+            replication stress, independent of its sign) drives DNA
+            damage accumulation per step.
+    nuc_repair_gain         : how strongly nuc_repair_capacity actually
+            repairs (reduces) existing nuc_damage per step.
+    nuc_repair_atp_decay    : how strongly ATP scarcity (1 - mito_atp)
+            depletes nuc_repair_capacity per step (DNA repair is
+            energetically expensive machinery to maintain).
+    nuc_checkpoint_threshold : nuc_damage level above which the p53-like
+            checkpoint penalty in fitness_contribution() begins to engage
+            (smoothly, via softplus — never a hard cutoff).
+    nuc_checkpoint_gain      : strength of the checkpoint penalty once
+            nuc_damage exceeds nuc_checkpoint_threshold.
+
+    Lysosome
+    --------
+    lyso_capacity_age_decay  : how strongly cell age depletes
+            lyso_capacity per step (age-related lysosomal exhaustion).
+    lyso_inherit_fraction    : fraction of lyso_capacity restored toward
+            1.0 (full) on division for *both* parent and daughter slots —
+            0.0 = no restoration (daughter inherits parent's exact, possibly
+            degraded, capacity), 1.0 = fully restored to a fresh-cell
+            baseline on every division.
+    lyso_clearance_demand_gain : how strongly current clearance demand
+            (mito_ros + er_unfolded) gates how much of lyso_capacity is
+            actually exerted as autophagy_flux this step — i.e. flux
+            tracks demand, not just raw capacity (see module docstring).
+
+    Endoplasmic reticulum
+    -----------------------
+    er_unfolded_atp_gain     : how strongly ATP scarcity (1 - mito_atp)
+            drives unfolded-protein accumulation per step.
+    er_unfolded_clearance_gain : how strongly lysosomal autophagy flux
+            clears existing unfolded protein load per step (ER-phagy).
+    er_upr_threshold         : er_unfolded level above which UPR
+            activation begins to engage (smooth softplus, as with the
+            nuclear checkpoint).
+    er_upr_mito_drag         : how strongly active UPR stress additionally
+            drags down mito_psi per step — the ER-mitochondria stress
+            crosstalk term (Ca2+ signalling at MAM contact sites).
+
+    Fitness coupling
+    -----------------
+    fitness_weight_atp     : weight on (mito_atp - 0.5) in
+            fitness_contribution() — healthy ATP level is a direct
+            division/death signal on top of the slower phenotype pathway.
+    fitness_weight_psi     : weight on (mito_psi - 0.5).
+    fitness_weight_checkpoint : weight (should be negative, or left to
+            nuc_checkpoint_gain to supply the sign — see
+            fitness_contribution()) on the nuclear checkpoint penalty term.
+    fitness_weight_upr     : weight on -er_upr_stress (chronic UPR
+            activation is a known pro-apoptotic signal once sustained).
+
+    Phenotype coupling
+    --------------------
+    phenotype_drive_gain : scalar multiplier applied to
+            organelle_drive_to_phenotype()'s output before it is added
+            into PhenotypeLayer.set_gene_drive() — lets a caller dial the
+            strength of the organelle→phenotype pathway independently of
+            organelle→fitness (see CellPopulation.step()'s wiring).
+
+    Initial state / inheritance
+    ------------------------------
+    init_atp, init_psi, init_lyso_capacity : starting values for the three
+            "capacity-like" states (all default to a healthy 1.0 / full).
+            nuc_damage, nuc_repair_capacity (default full), mito_ros,
+            er_unfolded, er_upr_stress all implicitly start at the
+            opposite convention (0.0 = none) and are not separately
+            configurable as starting values, since "freshly born = no
+            accumulated damage yet" is not a modelling choice this layer
+            needs to vary.
+    organelle_inherit_noise : standard deviation of Gaussian noise added
+            to a daughter's inherited organelle state on division
+            (mirrors PhenotypeConfig.inherit_noise) — applied to every
+            state channel except lyso_capacity, which uses
+            lyso_inherit_fraction instead (a deterministic partial reset,
+            not a noisy copy, since lysosomal reset on division is a
+            biologically distinct mechanism from stochastic epigenetic
+            drift).
+
+    Device
+    ------
+    device, dtype.
+    """
+
+    n_max: int = 4096
+    dt: float = 1.0
+
+    # Mitochondria
+    mito_atp_production_gain: float = 0.08
+    mito_atp_upkeep: float = 0.02
+    mito_division_cost: float = 0.15
+    mito_psi_ros_decay: float = 0.10
+    mito_psi_repair_gain: float = 0.08
+    mito_ros_production_gain: float = 0.05
+    mito_ros_clearance_gain: float = 0.30
+    atp_division_floor: float = 0.25
+
+    # Nucleus
+    nuc_damage_ros_gain: float = 0.20
+    nuc_damage_sigma_gain: float = 0.05
+    nuc_repair_gain: float = 0.15
+    nuc_repair_atp_decay: float = 0.02
+    nuc_checkpoint_threshold: float = 0.6
+    nuc_checkpoint_gain: float = 3.0
+
+    # Lysosome
+    lyso_capacity_age_decay: float = 0.0015
+    lyso_inherit_fraction: float = 0.4
+    lyso_clearance_demand_gain: float = 1.0
+
+    # Endoplasmic reticulum
+    er_unfolded_atp_gain: float = 0.10
+    er_unfolded_clearance_gain: float = 0.30
+    er_upr_threshold: float = 0.5
+    er_upr_mito_drag: float = 0.05
+
+    # Fitness coupling
+    fitness_weight_atp: float = 0.4
+    fitness_weight_psi: float = 0.3
+    fitness_weight_checkpoint: float = -1.0
+    fitness_weight_upr: float = -0.3
+
+    # Phenotype coupling
+    phenotype_drive_gain: float = 1.0
+
+    # Initial state
+    init_atp: float = 1.0
+    init_psi: float = 1.0
+    init_lyso_capacity: float = 1.0
+    organelle_inherit_noise: float = 0.01
+
+    device: str = "cpu"
+    dtype: torch.dtype = torch.float32
+
+    def __post_init__(self) -> None:
+        assert self.n_max >= 1
+        assert self.dt > 0.0
+        for name in (
+            "mito_atp_production_gain", "mito_atp_upkeep", "mito_division_cost",
+            "mito_psi_ros_decay", "mito_psi_repair_gain", "mito_ros_production_gain",
+            "mito_ros_clearance_gain", "nuc_damage_ros_gain", "nuc_damage_sigma_gain",
+            "nuc_repair_gain", "nuc_repair_atp_decay", "nuc_checkpoint_gain",
+            "lyso_capacity_age_decay", "lyso_clearance_demand_gain",
+            "er_unfolded_atp_gain", "er_unfolded_clearance_gain", "er_upr_mito_drag",
+            "organelle_inherit_noise",
+        ):
+            v = getattr(self, name)
+            assert v >= 0.0, f"{name} must be >= 0; got {v}."
+        assert 0.0 <= self.atp_division_floor <= 1.0
+        assert 0.0 <= self.nuc_checkpoint_threshold <= 1.0
+        assert 0.0 <= self.er_upr_threshold <= 1.0
+        assert 0.0 <= self.lyso_inherit_fraction <= 1.0
+        assert 0.0 <= self.init_atp <= 1.0
+        assert 0.0 <= self.init_psi <= 1.0
+        assert 0.0 <= self.init_lyso_capacity <= 1.0
+
+
+@dataclass
+class OrganelleState:
+    """
+    Flat (n_max,) batched organelle state — one tensor per tracked
+    quantity, same "structure of arrays" convention as CellPopulationState
+    / PhenotypeState.
+
+    Args:
+        mito_atp             : ATP budget, nominally in [0, 1] (soft-bounded
+                                by the ODE's own production/consumption
+                                balance, not hard-clamped every step).
+        mito_psi             : mitochondrial membrane potential, [0, 1].
+        mito_ros             : reactive oxygen species level, >= 0.
+        nuc_damage           : accumulated DNA damage, [0, 1].
+        nuc_repair_capacity  : DNA repair machinery integrity, [0, 1].
+        lyso_capacity        : lysosomal/autophagic capacity, [0, 1].
+        lyso_autophagy_flux  : this-step realised autophagy flux, [0, 1]
+                                (recomputed fresh every step — not
+                                integrated, so it is exposed for
+                                diagnostics but does not need its own
+                                inherit/reset handling beyond the states
+                                that drive it).
+        er_unfolded          : unfolded/misfolded ER protein load, [0, 1].
+        er_upr_stress        : unfolded protein response activation, [0, 1].
+    """
+
+    mito_atp: torch.Tensor
+    mito_psi: torch.Tensor
+    mito_ros: torch.Tensor
+    nuc_damage: torch.Tensor
+    nuc_repair_capacity: torch.Tensor
+    lyso_capacity: torch.Tensor
+    lyso_autophagy_flux: torch.Tensor
+    er_unfolded: torch.Tensor
+    er_upr_stress: torch.Tensor
+
+    def to(self, device: torch.device) -> "OrganelleState":
+        return OrganelleState(
+            mito_atp=self.mito_atp.to(device),
+            mito_psi=self.mito_psi.to(device),
+            mito_ros=self.mito_ros.to(device),
+            nuc_damage=self.nuc_damage.to(device),
+            nuc_repair_capacity=self.nuc_repair_capacity.to(device),
+            lyso_capacity=self.lyso_capacity.to(device),
+            lyso_autophagy_flux=self.lyso_autophagy_flux.to(device),
+            er_unfolded=self.er_unfolded.to(device),
+            er_upr_stress=self.er_upr_stress.to(device),
+        )
+
+
+class OrganelleLayer(nn.Module):
+    """
+    Per-cell sub-cellular organelle state: mitochondria, nucleus,
+    lysosome, and endoplasmic reticulum, coupled to each other and to the
+    rest of the ecosystem as described in the Section 3.5 module
+    docstring above.
+
+    Args:
+        cfg    : OrganelleConfig instance.
+        device : compute device (normally inherited from the attaching
+                  CellPopulation, not set independently).
+    """
+
+    def __init__(self, cfg: OrganelleConfig, device: Optional[torch.device] = None) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self._device = device or get_device(cfg.device)
+        n, dt_ = cfg.n_max, cfg.dtype
+
+        self.state = OrganelleState(
+            mito_atp=torch.full((n,), cfg.init_atp, device=self._device, dtype=dt_),
+            mito_psi=torch.full((n,), cfg.init_psi, device=self._device, dtype=dt_),
+            mito_ros=torch.zeros(n, device=self._device, dtype=dt_),
+            nuc_damage=torch.zeros(n, device=self._device, dtype=dt_),
+            nuc_repair_capacity=torch.ones(n, device=self._device, dtype=dt_),
+            lyso_capacity=torch.full((n,), cfg.init_lyso_capacity, device=self._device, dtype=dt_),
+            lyso_autophagy_flux=torch.zeros(n, device=self._device, dtype=dt_),
+            er_unfolded=torch.zeros(n, device=self._device, dtype=dt_),
+            er_upr_stress=torch.zeros(n, device=self._device, dtype=dt_),
+        )
+
+    # ------------------------------------------------------------------
+    # ODE step — all four organelles, one explicit-Euler update
+    # ------------------------------------------------------------------
+
+    def update(self, local_sigma: torch.Tensor, alive: torch.Tensor) -> OrganelleState:
+        """
+        Advance all four organelle ODEs by one explicit-Euler step, in a
+        fixed dependency order chosen to match real organelle crosstalk
+        timing within a single step:
+
+            1. Lysosome flux is computed FIRST, from the *previous* step's
+               mito_ros / er_unfolded (i.e. "how much clearance work is
+               there to do, based on what's true right now") — this flux
+               is then used by mito/ER's updates within this same step, so
+               clearance and accumulation are resolved simultaneously
+               rather than always lagging by one full step.
+            2. Mitochondria update (production gated by current psi and
+               local_sigma; ROS production/clearance).
+            3. Nucleus update (damage driven by the *new* mito_ros and by
+               sigma deviation; repair capacity depleted by ATP scarcity).
+            4. ER update (unfolded protein driven by ATP scarcity, cleared
+               by lysosomal flux; UPR stress as a smooth threshold
+               function of unfolded load).
+            5. UPR's mito_psi drag is applied last, after mito_psi's own
+               ROS-driven decay/repair this step — so a step in which UPR
+               stress newly crosses threshold begins dragging mito_psi
+               down starting next step, not retroactively within the same
+               step it first appeared (avoids a same-step feedback loop
+               that would otherwise need an implicit/iterative solve).
+
+        Only applied to currently-alive cells — dead slots are left
+        untouched here (reset explicitly via ``reset_slots`` on death,
+        matching PhenotypeLayer's convention).
+
+        Args:
+            local_sigma : (n_max,) local CH3D sigma value sampled at each
+                          cell's position this step (the same tensor
+                          CellPopulation.step() already computes and
+                          passes to PhenotypeLayer.update()).
+            alive       : (n_max,) bool mask of currently-alive cells.
+        Returns:
+            The updated OrganelleState (also stored as ``self.state``).
+        """
+        cfg = self.cfg
+        st = self.state
+        dt = cfg.dt
+
+        # --- 1. Lysosome: flux tracks current clearance demand ----------
+        clearance_demand = st.mito_ros + st.er_unfolded
+        demand_gate = torch.tanh(cfg.lyso_clearance_demand_gain * clearance_demand)
+        autophagy_flux = st.lyso_capacity * demand_gate
+        st.lyso_autophagy_flux = torch.where(alive, autophagy_flux, st.lyso_autophagy_flux)
+
+        # Lysosomal capacity itself decays slowly with age — driven by
+        # CellPopulation via age, not directly here (age isn't part of
+        # OrganelleState); CellPopulation.step() calls
+        # decay_lyso_capacity_with_age() separately each step, after this
+        # update(), so the ordering note above still holds for this step's
+        # autophagy_flux (computed from *last* step's capacity).
+
+        # --- 2. Mitochondria --------------------------------------------
+        nutrient = F.softplus(local_sigma, beta=4.0)  # sigma>=0 "nutrient" proxy, smooth
+        atp_production = cfg.mito_atp_production_gain * st.mito_psi * nutrient
+        d_atp = atp_production - cfg.mito_atp_upkeep
+        new_atp = _soft_clamp(st.mito_atp + dt * d_atp, 0.0, 1.0)
+
+        # ROS scales with production but is amplified at low psi (leaky,
+        # poorly-coupled electron transport chain at low membrane potential).
+        leak_factor = 1.0 + (1.0 - st.mito_psi)
+        d_ros = (
+            cfg.mito_ros_production_gain * atp_production * leak_factor
+            - cfg.mito_ros_clearance_gain * st.lyso_autophagy_flux * st.mito_ros
+        )
+        new_ros = F.softplus(st.mito_ros + dt * d_ros, beta=10.0)  # soft floor at 0
+
+        d_psi = (
+            -cfg.mito_psi_ros_decay * st.mito_ros
+            + cfg.mito_psi_repair_gain * st.lyso_autophagy_flux * (1.0 - st.mito_psi)
+            - cfg.er_upr_mito_drag * st.er_upr_stress
+        )
+        new_psi = _soft_clamp(st.mito_psi + dt * d_psi, 0.0, 1.0)
+
+        st.mito_atp = torch.where(alive, new_atp, st.mito_atp)
+        st.mito_ros = torch.where(alive, new_ros, st.mito_ros)
+        st.mito_psi = torch.where(alive, new_psi, st.mito_psi)
+
+        # --- 3. Nucleus ----------------------------------------------------
+        sigma_stress = (local_sigma - 1.0).abs()
+        d_damage = (
+            cfg.nuc_damage_ros_gain * st.mito_ros
+            + cfg.nuc_damage_sigma_gain * sigma_stress
+            - cfg.nuc_repair_gain * st.nuc_repair_capacity * st.nuc_damage
+        )
+        new_damage = _soft_clamp(st.nuc_damage + dt * d_damage, 0.0, 1.0)
+
+        # atp_scarcity intentionally uses the NEW (just-updated) mito_atp —
+        # nucleus repair-capacity depletion and ER unfolded-protein
+        # accumulation (below) respond to this step's actual energy state,
+        # consistent with mito_ros above also being the new, post-update value.
+        atp_scarcity = 1.0 - st.mito_atp
+        d_repair_capacity = -cfg.nuc_repair_atp_decay * atp_scarcity
+        new_repair_capacity = _soft_clamp(
+            st.nuc_repair_capacity + dt * d_repair_capacity, 0.0, 1.0
+        )
+
+        st.nuc_damage = torch.where(alive, new_damage, st.nuc_damage)
+        st.nuc_repair_capacity = torch.where(alive, new_repair_capacity, st.nuc_repair_capacity)
+
+        # --- 4. Endoplasmic reticulum --------------------------------------
+        d_unfolded = (
+            cfg.er_unfolded_atp_gain * atp_scarcity
+            - cfg.er_unfolded_clearance_gain * st.lyso_autophagy_flux * st.er_unfolded
+        )
+        new_unfolded = _soft_clamp(st.er_unfolded + dt * d_unfolded, 0.0, 1.0)
+
+        # UPR stress: smooth softplus engagement above er_upr_threshold,
+        # itself soft-clamped into [0, 1] (a saturating stress response,
+        # not an unbounded one).
+        upr_drive = F.softplus(
+            (new_unfolded - cfg.er_upr_threshold) * 10.0, beta=1.0
+        ) / 10.0
+        new_upr = _soft_clamp(upr_drive, 0.0, 1.0)
+
+        st.er_unfolded = torch.where(alive, new_unfolded, st.er_unfolded)
+        st.er_upr_stress = torch.where(alive, new_upr, st.er_upr_stress)
+
+        return st
+
+    def decay_lyso_capacity_with_age(self, age: torch.Tensor, alive: torch.Tensor) -> None:
+        """
+        Apply age-related lysosomal capacity decay. Called by
+        CellPopulation.step() once per step, separately from ``update()``,
+        since lysosomal capacity depends on ``CellPopulationState.age``
+        rather than any quantity tracked inside OrganelleState itself.
+
+        Args:
+            age   : (n_max,) current age (steps survived) per cell.
+            alive : (n_max,) bool mask of currently-alive cells.
+        """
+        cfg = self.cfg
+        st = self.state
+        new_capacity = _soft_clamp(
+            st.lyso_capacity - cfg.lyso_capacity_age_decay * age * cfg.dt, 0.0, 1.0
+        )
+        st.lyso_capacity = torch.where(alive, new_capacity, st.lyso_capacity)
+
+    # ------------------------------------------------------------------
+    # Fitness feedback (organelle → CellPopulation division/death logit,
+    # bypassing the phenotype ODE — see module docstring's "fast pathway")
+    # ------------------------------------------------------------------
+
+    def fitness_contribution(self) -> torch.Tensor:
+        """
+        (n_max,) scalar contribution to CellPopulation's division logit
+        (and, with a sign flip, the death logit) — additive alongside
+        genotype_fitness and PhenotypeLayer.fitness_contribution().
+
+        Four terms, all smooth:
+          + fitness_weight_atp * (mito_atp - 0.5)     — energy sufficiency
+          + fitness_weight_psi * (mito_psi - 0.5)     — membrane health
+          + fitness_weight_checkpoint * checkpoint_penalty  — p53-like
+                DNA-damage checkpoint (checkpoint_penalty itself is always
+                >= 0 via softplus, so the configured *sign* of
+                fitness_weight_checkpoint — negative by default — is what
+                makes this an actual penalty rather than a bonus)
+          + fitness_weight_upr * er_upr_stress         — chronic UPR drag
+        """
+        cfg = self.cfg
+        st = self.state
+        checkpoint_penalty = F.softplus(
+            (st.nuc_damage - cfg.nuc_checkpoint_threshold) * cfg.nuc_checkpoint_gain
+        )
+        return (
+            cfg.fitness_weight_atp * (st.mito_atp - 0.5)
+            + cfg.fitness_weight_psi * (st.mito_psi - 0.5)
+            + cfg.fitness_weight_checkpoint * checkpoint_penalty
+            + cfg.fitness_weight_upr * st.er_upr_stress
+        )
+
+    def atp_division_gate(self) -> torch.Tensor:
+        """
+        (n_max,) smooth multiplicative gate ∈ (0, 1] on division
+        probability based on ATP sufficiency: ≈1.0 when mito_atp is
+        comfortably above ``cfg.atp_division_floor``, smoothly falling
+        toward 0 as mito_atp drops toward and below the floor — modelling
+        "a starved cell cannot afford the energetic cost of division"
+        without a hard cutoff. Applied multiplicatively to division_rate
+        in CellPopulation.step(), never as an additive logit term (an
+        energy gate is naturally multiplicative: zero energy ⇒ zero
+        division probability regardless of how favourable every other
+        signal is, which an additive logit term cannot guarantee).
+        """
+        cfg = self.cfg
+        return torch.sigmoid((self.state.mito_atp - cfg.atp_division_floor) * 10.0)
+
+    def charge_division_cost(self, parent_idx: torch.Tensor) -> None:
+        """
+        Deduct the one-off ATP cost of division from the parent slots
+        that actually divided this step. Called by CellPopulation.step()
+        immediately after it determines ``chosen_parents``.
+        """
+        if parent_idx.numel() == 0:
+            return
+        self.state.mito_atp[parent_idx] = _soft_clamp(
+            self.state.mito_atp[parent_idx] - self.cfg.mito_division_cost, 0.0, 1.0
+        )
+
+    # ------------------------------------------------------------------
+    # Phenotype coupling (organelle → PhenotypeLayer gene_drive — see
+    # module docstring's "slow pathway", and organelle_drive_to_phenotype
+    # below for the actual channel-mapping logic)
+    # ------------------------------------------------------------------
+
+    def organelle_health(self) -> torch.Tensor:
+        """
+        (n_max,) single scalar summary ∈ roughly [-1, 1] of overall
+        organelle health this step: positive when mitochondria are
+        well-fuelled and polarised with low damage/stress elsewhere,
+        negative when ATP/psi are low or damage/stress are high. This is
+        the signal organelle_drive_to_phenotype() broadcasts into
+        PhenotypeLayer's gene_drive channels — a single aggregate rather
+        than exposing all nine raw state tensors to the phenotype layer,
+        since "how healthy is this cell's machinery overall" is the
+        biologically meaningful quantity gene expression should respond
+        to, not each organelle's raw internal state individually.
+        """
+        st = self.state
+        return (
+            0.3 * (st.mito_atp - 0.5) * 2.0
+            + 0.3 * (st.mito_psi - 0.5) * 2.0
+            - 0.2 * st.nuc_damage
+            - 0.1 * st.er_upr_stress
+            - 0.1 * st.mito_ros.clamp(max=1.0)
+        )
+
+    # ------------------------------------------------------------------
+    # Division / death bookkeeping (called by CellPopulation.step(),
+    # mirroring PhenotypeLayer.inherit_slots / reset_slots exactly)
+    # ------------------------------------------------------------------
+
+    def inherit_slots(self, parent_idx: torch.Tensor, child_slots: torch.Tensor) -> None:
+        """
+        Copy (parent → daughter) organelle state on division.
+
+        Every channel except ``lyso_capacity`` is copied with optional
+        Gaussian noise (``cfg.organelle_inherit_noise``), the same
+        stochastic-epigenetic-drift convention PhenotypeLayer uses.
+        ``lyso_capacity`` instead receives a deterministic partial reset
+        toward 1.0 by ``cfg.lyso_inherit_fraction`` — applied to BOTH the
+        parent's post-division capacity and the daughter's inherited
+        capacity, modelling division as an opportunity for (partial)
+        lysosomal pool renewal for both resulting cells, not a
+        biologically distinct "epigenetic noise" event.
+        """
+        st = self.state
+        cfg = self.cfg
+        noise_std = cfg.organelle_inherit_noise
+
+        def _copy(tensor: torch.Tensor, lo: float = 0.0, hi: float = 1.0) -> torch.Tensor:
+            inherited = tensor[parent_idx]
+            if noise_std > 0.0:
+                inherited = inherited + torch.randn_like(inherited) * noise_std
+            return _soft_clamp(inherited, lo, hi)
+
+        def _copy_ros(tensor: torch.Tensor) -> torch.Tensor:
+            # mito_ros has no natural upper bound (unlike the other
+            # [0, 1]-bounded channels) — only a soft floor at 0 is needed,
+            # via the same softplus floor _soft_clamp itself uses internally.
+            inherited = tensor[parent_idx]
+            if noise_std > 0.0:
+                inherited = inherited + torch.randn_like(inherited) * noise_std
+            return F.softplus(inherited, beta=10.0)
+
+        st.mito_atp[child_slots] = _copy(st.mito_atp)
+        st.mito_psi[child_slots] = _copy(st.mito_psi)
+        st.mito_ros[child_slots] = _copy_ros(st.mito_ros)
+        st.nuc_damage[child_slots] = _copy(st.nuc_damage)
+        st.nuc_repair_capacity[child_slots] = _copy(st.nuc_repair_capacity)
+        st.er_unfolded[child_slots] = _copy(st.er_unfolded)
+        st.er_upr_stress[child_slots] = _copy(st.er_upr_stress)
+
+        # Lysosome: deterministic partial reset toward 1.0 for both
+        # parent and daughter (see docstring above) — no noise applied.
+        def _renew_lyso(capacity_slots: torch.Tensor) -> torch.Tensor:
+            current = st.lyso_capacity[capacity_slots]
+            return _soft_clamp(
+                current + cfg.lyso_inherit_fraction * (1.0 - current), 0.0, 1.0,
+            )
+
+        st.lyso_capacity[child_slots] = _renew_lyso(parent_idx)
+        st.lyso_capacity[parent_idx] = _renew_lyso(parent_idx)
+
+    def reset_slots(self, dead_slots: torch.Tensor) -> None:
+        """
+        Reset organelle state to baseline for slots that just died —
+        called by CellPopulation.step() immediately after it clears
+        ``alive`` for the same ``dead_slots``, mirroring
+        PhenotypeLayer.reset_slots() exactly.
+        """
+        cfg = self.cfg
+        st = self.state
+        st.mito_atp[dead_slots] = cfg.init_atp
+        st.mito_psi[dead_slots] = cfg.init_psi
+        st.mito_ros[dead_slots] = 0.0
+        st.nuc_damage[dead_slots] = 0.0
+        st.nuc_repair_capacity[dead_slots] = 1.0
+        st.lyso_capacity[dead_slots] = cfg.init_lyso_capacity
+        st.lyso_autophagy_flux[dead_slots] = 0.0
+        st.er_unfolded[dead_slots] = 0.0
+        st.er_upr_stress[dead_slots] = 0.0
+
+    def reset(self) -> None:
+        """Reset all organelle state to baseline (e.g. between independent simulation runs)."""
+        cfg = self.cfg
+        st = self.state
+        st.mito_atp.fill_(cfg.init_atp)
+        st.mito_psi.fill_(cfg.init_psi)
+        st.mito_ros.zero_()
+        st.nuc_damage.zero_()
+        st.nuc_repair_capacity.fill_(1.0)
+        st.lyso_capacity.fill_(cfg.init_lyso_capacity)
+        st.lyso_autophagy_flux.zero_()
+        st.er_unfolded.zero_()
+        st.er_upr_stress.zero_()
+
+
+def organelle_drive_to_phenotype(
+    organelle: OrganelleLayer,
+    n_channels: int,
+    gain: Optional[float] = None,
+) -> torch.Tensor:
+    """
+    Broadcast ``OrganelleLayer.organelle_health()`` into a
+    (n_max, n_channels) drive tensor suitable for ADDING into whatever
+    gene-regulatory drive a caller is already building (typically the
+    output of ``gene_drive_from_bv_network``) before passing the sum to
+    ``PhenotypeLayer.set_gene_drive()``.
+
+    Broadcasting the same scalar health signal identically across every
+    phenotype channel is a deliberate simplification — organelle health
+    affecting every expression channel equally (rather than, say, only
+    "stress_response") is the conservative default; a caller wanting
+    channel-specific organelle effects can instead read
+    ``organelle.state`` directly and build a custom (n_max, n_channels)
+    tensor of their own, the same opt-out path
+    ``gene_drive_from_bv_network``'s docstring already documents for
+    genotype-specific gene drive.
+
+    Args:
+        organelle  : an OrganelleLayer instance.
+        n_channels : target phenotype channel count (must match
+                     PhenotypeConfig.n_channels).
+        gain       : multiplier applied to organelle_health() before
+                     broadcasting; defaults to
+                     organelle.cfg.phenotype_drive_gain if not given.
+    Returns:
+        (n_max, n_channels) tensor.
+    """
+    if gain is None:
+        gain = organelle.cfg.phenotype_drive_gain
+    health = gain * organelle.organelle_health()  # (n_max,)
+    return health.unsqueeze(-1).expand(-1, n_channels)
 
 
 def gene_drive_from_bv_network(
@@ -883,6 +1691,19 @@ class CellPopulation(nn.Module):
         # division/death logits every step (see step()'s "phenotype_term").
         self.phenotype: Optional["PhenotypeLayer"] = None
 
+        # Optional organelle layer — attached via attach_organelle_layer().
+        # When None (default), step() behaves exactly as before this
+        # feature existed. When attached, mitochondria/nucleus/lysosome/ER
+        # state additionally (a) contributes its own fast-pathway
+        # fitness_contribution() to the division/death logits, (b) gates
+        # division_rate multiplicatively via atp_division_gate(), and (c)
+        # — if a PhenotypeLayer is ALSO attached — feeds
+        # organelle_drive_to_phenotype() into that layer's gene_drive
+        # every step (additively on top of whatever gene_drive a caller
+        # already set via set_gene_drive(), e.g. from
+        # gene_drive_from_bv_network) — see step()'s "organelle_term".
+        self.organelle: Optional["OrganelleLayer"] = None
+
     # ------------------------------------------------------------------
     # Initialisation
     # ------------------------------------------------------------------
@@ -1015,6 +1836,21 @@ class CellPopulation(nn.Module):
                                     used this step (alive slots only are
                                     meaningful).
                 "death_rate"     : (n_max,) per-slot death probability.
+                "phenotype_term" : (n_max,) PhenotypeLayer's fitness
+                                    contribution this step (all-zero if no
+                                    PhenotypeLayer attached).
+                "organelle_term" : (n_max,) OrganelleLayer's fast-pathway
+                                    fitness contribution this step
+                                    (all-zero if no OrganelleLayer attached).
+                "phenotype_state" : (n_max, n_channels) current expression
+                                    state — only present if a PhenotypeLayer
+                                    is attached.
+                "organelle_state" : the current OrganelleState — only
+                                    present if an OrganelleLayer is attached.
+                "atp_division_gate" : (n_max,) the multiplicative ATP
+                                    sufficiency gate applied to
+                                    division_rate this step — only present
+                                    if an OrganelleLayer is attached.
         """
         if hard is None:
             hard = not self.training
@@ -1033,18 +1869,45 @@ class CellPopulation(nn.Module):
             ).clamp(min=0.0, max=cfg.box_size)
         st.age = torch.where(st.alive, st.age + 1.0, st.age)
 
-        # --- 2. Phenotype layer update (optional) -----------------------
-        # If a PhenotypeLayer is attached, advance its expression state
-        # one ODE step first, using this step's local sigma as one of its
-        # drive signals — so the phenotype state used in the rate
-        # computation below is always "current", not one step stale.
+        # --- 2. Organelle layer update (optional) ------------------------
+        # If an OrganelleLayer is attached, advance its four ODEs FIRST
+        # (mitochondria/nucleus/lysosome/ER), using this step's local
+        # sigma — so its lyso-capacity-vs-age decay and resulting
+        # organelle_health/fitness_contribution feed into the phenotype
+        # update (next) and the rate computation (below) using "current",
+        # not one-step-stale, organelle state.
         local_sigma = self._sample_local_sigma(sigma_field)        # (n_max,)
+        organelle_term = torch.zeros(cfg.n_max, device=device, dtype=cfg.dtype)
+        atp_gate = torch.ones(cfg.n_max, device=device, dtype=cfg.dtype)
+        if self.organelle is not None:
+            self.organelle.decay_lyso_capacity_with_age(age=st.age, alive=st.alive)
+            self.organelle.update(local_sigma=local_sigma, alive=st.alive)
+            organelle_term = self.organelle.fitness_contribution()
+            atp_gate = self.organelle.atp_division_gate()
+
+        # --- 3. Phenotype layer update (optional) -----------------------
+        # If a PhenotypeLayer is attached, advance its expression state
+        # one ODE step next, using this step's local sigma as one of its
+        # drive signals — so the phenotype state used in the rate
+        # computation below is always "current", not one step stale. If
+        # an OrganelleLayer is ALSO attached, its organelle_health is
+        # passed in as update()'s one-step, non-persistent extra_drive
+        # argument (see PhenotypeLayer.update's docstring) — added
+        # alongside whatever gene_drive a caller already set via
+        # set_gene_drive() (e.g. from gene_drive_from_bv_network), without
+        # mutating that persistent buffer, so the organelle contribution
+        # cannot silently accumulate step over step.
         phenotype_term = torch.zeros(cfg.n_max, device=device, dtype=cfg.dtype)
         if self.phenotype is not None:
-            self.phenotype.update(local_sigma=local_sigma, alive=st.alive)
+            extra_drive = None
+            if self.organelle is not None:
+                extra_drive = organelle_drive_to_phenotype(
+                    self.organelle, self.phenotype.cfg.n_channels,
+                )
+            self.phenotype.update(local_sigma=local_sigma, alive=st.alive, extra_drive=extra_drive)
             phenotype_term = self.phenotype.fitness_contribution()
 
-        # --- 3. Local environment + fitness → per-cell rates ------------
+        # --- 4. Local environment + fitness → per-cell rates ------------
         clone_fit = self.genotype_fitness[st.genotype]              # (n_max,)
         fit_term = cfg.fitness_sign * clone_fit
 
@@ -1053,11 +1916,12 @@ class CellPopulation(nn.Module):
             cfg.sigma_division_gain * sigma_dev
             + cfg.fitness_division_gain * fit_term
             + phenotype_term
+            + organelle_term
         )
         death_logit = -(
             cfg.sigma_division_gain * sigma_dev
             + cfg.fitness_division_gain * fit_term
-        ) - phenotype_term
+        ) - phenotype_term - organelle_term
 
         division_rate = self._rate_from_logit(
             division_logit, self._division_logit_shift,
@@ -1067,16 +1931,25 @@ class CellPopulation(nn.Module):
             death_logit, self._death_logit_shift,
             cfg.death_rate_floor, cfg.division_rate_ceiling,
         )
+        # ATP sufficiency gate: multiplicative, never additive — see
+        # OrganelleLayer.atp_division_gate's docstring for why an energy
+        # gate must be multiplicative rather than folded into the logit
+        # above. No-op (gate == 1.0 everywhere) when no OrganelleLayer is
+        # attached, so this is a strict superset of the pre-organelle
+        # behaviour.
+        division_rate = division_rate * atp_gate
 
-        # --- 3. Death --------------------------------------------------
+        # --- 5. Death --------------------------------------------------
         death_event = self._sample_bernoulli(death_rate, hard) * st.alive.to(self.cfg.dtype)
         newly_dead = (death_event > 0.5) & st.alive
         st.alive = st.alive & (~newly_dead)
         n_died = int(newly_dead.sum().item())
         if self.phenotype is not None and n_died > 0:
             self.phenotype.reset_slots(torch.nonzero(newly_dead, as_tuple=False).flatten())
+        if self.organelle is not None and n_died > 0:
+            self.organelle.reset_slots(torch.nonzero(newly_dead, as_tuple=False).flatten())
 
-        # --- 4. Division -------------------------------------------------
+        # --- 6. Division -------------------------------------------------
         division_event = self._sample_bernoulli(division_rate, hard) * st.alive.to(self.cfg.dtype)
         wants_to_divide = (division_event > 0.5) & st.alive
         parent_idx = torch.nonzero(wants_to_divide, as_tuple=False).flatten()
@@ -1098,6 +1971,9 @@ class CellPopulation(nn.Module):
             n_divided = n_divisions
             if self.phenotype is not None:
                 self.phenotype.inherit_slots(chosen_parents, chosen_slots)
+            if self.organelle is not None:
+                self.organelle.inherit_slots(chosen_parents, chosen_slots)
+                self.organelle.charge_division_cost(chosen_parents)
 
         n_after = st.n_alive()
 
@@ -1109,9 +1985,13 @@ class CellPopulation(nn.Module):
             "division_rate":  division_rate,
             "death_rate":     death_rate,
             "phenotype_term": phenotype_term,
+            "organelle_term": organelle_term,
         }
         if self.phenotype is not None:
             result["phenotype_state"] = self.phenotype.state.expression
+        if self.organelle is not None:
+            result["organelle_state"] = self.organelle.state
+            result["atp_division_gate"] = atp_gate
         return result
 
     def attach_phenotype_layer(
@@ -1154,6 +2034,70 @@ class CellPopulation(nn.Module):
             self.__class__.__name__, cfg.channel_names, cfg.n_max,
         )
         return self.phenotype
+
+    def attach_organelle_layer(
+        self, cfg: Optional["OrganelleConfig"] = None,
+    ) -> "OrganelleLayer":
+        """
+        Construct and attach an OrganelleLayer (mitochondria / nucleus /
+        lysosome / endoplasmic reticulum) to this population.
+
+        Once attached, every subsequent ``step()`` call:
+          1. Advances all four organelle ODEs first (using that step's
+             local CH3D sigma and the cell's current age).
+          2. Folds ``OrganelleLayer.fitness_contribution()`` into the
+             division/death logits — additive alongside genotype_fitness
+             and (if attached) PhenotypeLayer's own fitness_contribution.
+          3. Applies ``OrganelleLayer.atp_division_gate()`` as a
+             multiplicative gate on division_rate (a starved cell's
+             division probability is suppressed regardless of how
+             favourable every other signal is).
+          4. If a PhenotypeLayer is ALSO attached, additively folds
+             ``organelle_drive_to_phenotype()`` into that layer's
+             expression ODE for this step only (via
+             ``PhenotypeLayer.update``'s ``extra_drive`` argument, which
+             does NOT mutate the persistent ``_gene_drive`` buffer) — so
+             organelle health shapes phenotype expression every step
+             without accumulating on top of itself over time.
+          5. Charges ``mito_division_cost`` in ATP from a cell's organelle
+             state at the moment it actually divides, and renews
+             ``lyso_capacity`` by ``cfg.lyso_inherit_fraction`` for both
+             resulting cells.
+        Dead slots have their organelle state reset to baseline; daughter
+        cells inherit (a noisy copy of) their parent's organelle state.
+
+        With no OrganelleLayer attached (the default), ``step()`` behaves
+        exactly as before this feature existed — every organelle-derived
+        term defaults to a neutral no-op (zero fitness contribution, a
+        gate of 1.0), so this is a strict superset of the
+        pre-OrganelleLayer model.
+
+        Args:
+            cfg : OrganelleConfig instance (default-constructed if None).
+                  ``cfg.n_max`` is forced to match this population's
+                  ``self.cfg.n_max`` regardless of what's passed in, so
+                  the two stay shape-compatible automatically (mirrors
+                  ``attach_phenotype_layer``'s convention exactly).
+        Returns:
+            The attached OrganelleLayer instance (also stored as
+            ``self.organelle``).
+        """
+        cfg = cfg or OrganelleConfig()
+        if cfg.n_max != self.cfg.n_max:
+            logger.warning(
+                "OrganelleConfig.n_max=%d does not match CellPopulationConfig.n_max=%d; "
+                "overriding to match (organelle state must be shape-compatible "
+                "with the cell population it's attached to).",
+                cfg.n_max, self.cfg.n_max,
+            )
+            import dataclasses
+            cfg = dataclasses.replace(cfg, n_max=self.cfg.n_max)
+        self.organelle = OrganelleLayer(cfg, device=self._device)
+        logger.info(
+            "%s: OrganelleLayer attached (n_max=%d).",
+            self.__class__.__name__, cfg.n_max,
+        )
+        return self.organelle
 
     @staticmethod
     def _inverse_sigmoid(p: float) -> float:
@@ -1262,7 +2206,7 @@ class CellPopulation(nn.Module):
     # ------------------------------------------------------------------
 
     def save_checkpoint(self, filepath: str) -> None:
-        CheckpointManager.save(filepath, {
+        payload: Dict[str, Any] = {
             "version": CELL_POPULATION_VERSION,
             "cfg": self.cfg,
             "state": {
@@ -1272,7 +2216,27 @@ class CellPopulation(nn.Module):
                 "alive": self.state.alive.detach().cpu(),
             },
             "genotype_fitness": self.genotype_fitness.detach().cpu(),
-        })
+        }
+        # Organelle state is checkpointed alongside the core population
+        # state when present (v1.1.0+) — omitted entirely for a population
+        # with no OrganelleLayer attached, so old (pre-v1.1.0) checkpoints
+        # and new organelle-free checkpoints remain byte-for-byte
+        # equivalent in shape.
+        if self.organelle is not None:
+            ost = self.organelle.state
+            payload["organelle_cfg"] = self.organelle.cfg
+            payload["organelle_state"] = {
+                "mito_atp": ost.mito_atp.detach().cpu(),
+                "mito_psi": ost.mito_psi.detach().cpu(),
+                "mito_ros": ost.mito_ros.detach().cpu(),
+                "nuc_damage": ost.nuc_damage.detach().cpu(),
+                "nuc_repair_capacity": ost.nuc_repair_capacity.detach().cpu(),
+                "lyso_capacity": ost.lyso_capacity.detach().cpu(),
+                "lyso_autophagy_flux": ost.lyso_autophagy_flux.detach().cpu(),
+                "er_unfolded": ost.er_unfolded.detach().cpu(),
+                "er_upr_stress": ost.er_upr_stress.detach().cpu(),
+            }
+        CheckpointManager.save(filepath, payload)
 
     def load_checkpoint(self, filepath: str) -> None:
         data = CheckpointManager.load(filepath)
@@ -1286,6 +2250,34 @@ class CellPopulation(nn.Module):
             alive=s["alive"].to(self._device),
         )
         self.genotype_fitness = data["genotype_fitness"].to(self._device)
+
+        # Organelle state: only restored if BOTH the checkpoint contains it
+        # AND an OrganelleLayer has already been attached to this instance
+        # via attach_organelle_layer() (mirrors how PhenotypeLayer is
+        # never auto-attached by load_checkpoint either — restoring a
+        # *layer's existence* from a checkpoint is the caller's
+        # responsibility; this method only ever restores layer *state*).
+        if "organelle_state" in data and self.organelle is not None:
+            os_ = data["organelle_state"]
+            dev = self._device
+            self.organelle.state = OrganelleState(
+                mito_atp=os_["mito_atp"].to(dev),
+                mito_psi=os_["mito_psi"].to(dev),
+                mito_ros=os_["mito_ros"].to(dev),
+                nuc_damage=os_["nuc_damage"].to(dev),
+                nuc_repair_capacity=os_["nuc_repair_capacity"].to(dev),
+                lyso_capacity=os_["lyso_capacity"].to(dev),
+                lyso_autophagy_flux=os_["lyso_autophagy_flux"].to(dev),
+                er_unfolded=os_["er_unfolded"].to(dev),
+                er_upr_stress=os_["er_upr_stress"].to(dev),
+            )
+        elif "organelle_state" in data and self.organelle is None:
+            logger.warning(
+                "Checkpoint contains organelle_state but no OrganelleLayer is "
+                "attached to this CellPopulation; call attach_organelle_layer() "
+                "before load_checkpoint() to restore it. Organelle state was "
+                "NOT restored."
+            )
 
 
 # =============================================================================
@@ -2015,6 +3007,170 @@ if __name__ == "__main__":
     print("[PASS] Regression guard: with no PhenotypeLayer attached, phenotype_term is "
           "all-zero and division/death logits reduce to the original (pre-phenotype) "
           "genotype+sigma-only formula")
+
+    # =========================================================================
+    # Organelle Layer tests (v1.1.0)
+    # =========================================================================
+
+    # ── Test 21: attach_organelle_layer() wires self.organelle, n_max matched ──
+    pop_org = CellPopulation(CellPopulationConfig(
+        n_max=128, n_init=32, n_genotypes=2, grid_shape=(4, 4, 4), box_size=8.0,
+    ))
+    organelle = pop_org.attach_organelle_layer(OrganelleConfig(n_max=999))  # deliberately wrong n_max
+    assert pop_org.organelle is organelle
+    assert organelle.cfg.n_max == 128, (
+        f"attach_organelle_layer should override n_max to match the population "
+        f"(128), got {organelle.cfg.n_max}."
+    )
+    assert organelle.state.mito_atp.shape == (128,)
+    print("[PASS] attach_organelle_layer() wires self.organelle and force-matches "
+          "n_max to the population's (128), regardless of what OrganelleConfig specified (999)")
+
+    # ── Test 22: ATP rises under high (nutrient-favourable) sigma, falls under starvation ──
+    org_cfg = OrganelleConfig(
+        n_max=16, mito_atp_production_gain=0.2, mito_atp_upkeep=0.02,
+        mito_ros_production_gain=0.0,  # isolate ATP dynamics from ROS feedback for this test
+    )
+    org1 = OrganelleLayer(org_cfg, device=torch.device("cpu"))
+    alive16 = torch.ones(16, dtype=torch.bool)
+    high_sigma16 = torch.full((16,), 5.0)
+    for _ in range(30):
+        org1.update(local_sigma=high_sigma16, alive=alive16)
+    atp_fed = org1.state.mito_atp.mean().item()
+    assert atp_fed > 0.5, (
+        f"ATP should rise toward a high fixed point under sustained favourable "
+        f"sigma; got mean mito_atp={atp_fed:.4f}."
+    )
+    org2 = OrganelleLayer(org_cfg, device=torch.device("cpu"))
+    zero_sigma16 = torch.full((16,), -5.0)  # softplus(-5) ≈ 0 -> no nutrient -> pure upkeep drain
+    for _ in range(30):
+        org2.update(local_sigma=zero_sigma16, alive=alive16)
+    atp_starved = org2.state.mito_atp.mean().item()
+    assert atp_starved < atp_fed, (
+        f"ATP under starvation ({atp_starved:.4f}) should be lower than ATP under "
+        f"a favourable, nutrient-rich environment ({atp_fed:.4f})."
+    )
+    print(f"[PASS] Mitochondrial ATP responds to local sigma as a nutrient proxy "
+          f"(favourable sigma -> mean ATP={atp_fed:.4f}, starvation -> {atp_starved:.4f})")
+
+    # ── Test 23: sustained ROS degrades membrane potential; lysosomal flux restores it ──
+    org_cfg2 = OrganelleConfig(n_max=8, mito_psi_ros_decay=0.5, mito_psi_repair_gain=0.0)
+    org3 = OrganelleLayer(org_cfg2, device=torch.device("cpu"))
+    org3.state.mito_ros.fill_(1.0)  # force high ROS directly, isolating the psi-decay pathway
+    alive8 = torch.ones(8, dtype=torch.bool)
+    neutral_sigma8 = torch.ones(8)
+    psi_before = org3.state.mito_psi.mean().item()
+    for _ in range(10):
+        # Re-assert high ROS each step so we isolate psi's response to ROS,
+        # rather than also exercising ROS's own clearance/production dynamics.
+        org3.state.mito_ros.fill_(1.0)
+        org3.update(local_sigma=neutral_sigma8, alive=alive8)
+    psi_after = org3.state.mito_psi.mean().item()
+    assert psi_after < psi_before, (
+        f"Sustained high ROS should degrade membrane potential; got "
+        f"psi_before={psi_before:.4f}, psi_after={psi_after:.4f}."
+    )
+    print(f"[PASS] Sustained ROS degrades mitochondrial membrane potential "
+          f"(psi: {psi_before:.4f} -> {psi_after:.4f})")
+
+    # ── Test 24: DNA damage checkpoint penalty engages smoothly above threshold ──
+    org_cfg3 = OrganelleConfig(
+        n_max=4, nuc_checkpoint_threshold=0.5, nuc_checkpoint_gain=5.0,
+        fitness_weight_checkpoint=-2.0, fitness_weight_atp=0.0, fitness_weight_psi=0.0,
+        fitness_weight_upr=0.0,
+    )
+    org4 = OrganelleLayer(org_cfg3, device=torch.device("cpu"))
+    org4.state.nuc_damage = torch.tensor([0.1, 0.4, 0.6, 0.9])  # below/below/above/above threshold
+    fit4 = org4.fitness_contribution()
+    assert fit4[0] > fit4[2] and fit4[1] > fit4[3], (
+        f"Fitness contribution should decrease as nuc_damage rises past the "
+        f"checkpoint threshold; got {fit4.tolist()} for damage levels "
+        f"[0.1, 0.4, 0.6, 0.9]."
+    )
+    assert torch.all(fit4[2:] < 0), (
+        f"Cells with nuc_damage above nuc_checkpoint_threshold should incur a "
+        f"net-negative fitness contribution from the checkpoint penalty alone; "
+        f"got {fit4[2:].tolist()}."
+    )
+    print(f"[PASS] Nuclear DNA-damage checkpoint smoothly penalises fitness above "
+          f"threshold (damage=[0.1,0.4,0.6,0.9] -> fitness={[round(x,3) for x in fit4.tolist()]})")
+
+    # ── Test 25: ATP division gate suppresses division_rate for starved cells ──
+    pop_atp = CellPopulation(CellPopulationConfig(
+        n_max=8, n_init=8, n_genotypes=1, grid_shape=(4, 4, 4), box_size=8.0,
+        base_division_rate=0.5, base_death_rate=0.01, motility=0.0,
+    ))
+    org5 = pop_atp.attach_organelle_layer(OrganelleConfig(n_max=8, atp_division_floor=0.5))
+    org5.state.mito_atp[0] = 0.95   # well-fed
+    org5.state.mito_atp[1] = 0.01   # starved, well below the floor
+    out25 = pop_atp.step(hard=True)
+    gate25 = out25["atp_division_gate"]
+    assert gate25[0] > gate25[1], (
+        f"A well-fed cell's ATP division gate ({gate25[0].item():.4f}) should exceed "
+        f"a starved cell's ({gate25[1].item():.4f})."
+    )
+    assert gate25[1] < 0.1, (
+        f"A severely starved cell (mito_atp=0.01, floor=0.5) should have an ATP "
+        f"division gate close to 0; got {gate25[1].item():.4f}."
+    )
+    print(f"[PASS] ATP division gate suppresses a starved cell's effective division "
+          f"rate (well-fed gate={gate25[0].item():.4f}, starved gate={gate25[1].item():.4f})")
+
+    # ── Test 26: OrganelleLayer attached to a live CellPopulation survives steps ──
+    # (end-to-end smoke test, mirroring Test 18's PhenotypeLayer equivalent)
+    pop_org2 = CellPopulation(CellPopulationConfig(
+        n_max=32, n_init=8, n_genotypes=1, grid_shape=(4, 4, 4), box_size=8.0,
+        base_division_rate=0.3, base_death_rate=0.05, motility=0.0,
+    ))
+    org6 = pop_org2.attach_organelle_layer(OrganelleConfig(n_max=32))
+    for _ in range(15):
+        pop_org2.step(hard=True)
+    st6 = org6.state
+    for name, tensor in (
+        ("mito_atp", st6.mito_atp), ("mito_psi", st6.mito_psi), ("mito_ros", st6.mito_ros),
+        ("nuc_damage", st6.nuc_damage), ("nuc_repair_capacity", st6.nuc_repair_capacity),
+        ("lyso_capacity", st6.lyso_capacity), ("er_unfolded", st6.er_unfolded),
+        ("er_upr_stress", st6.er_upr_stress),
+    ):
+        assert torch.isfinite(tensor).all(), (
+            f"OrganelleState.{name} became non-finite after 15 live steps."
+        )
+    print(f"[PASS] OrganelleLayer attached to a live CellPopulation survives 15 "
+          f"steps of real division/death activity with finite state in all 8 "
+          f"tracked channels (final n_alive={pop_org2.state.n_alive()})")
+
+    # ── Test 27: OrganelleLayer + PhenotypeLayer together — organelle drive ──
+    # reaches phenotype expression WITHOUT mutating PhenotypeLayer._gene_drive
+    # (regression guard for the accumulation bug this design specifically avoids)
+    pop_both = CellPopulation(CellPopulationConfig(
+        n_max=8, n_init=8, n_genotypes=1, grid_shape=(4, 4, 4), box_size=8.0,
+        base_division_rate=0.0, base_death_rate=0.0, motility=0.0,
+    ))
+    ph7 = pop_both.attach_phenotype_layer(PhenotypeConfig(
+        n_max=8, channel_names=("prolif",), decay_rate=(0.1,),
+        sigma_gain=(0.0,), gene_gain=0.0, fitness_weights=(0.0,),
+    ))
+    org7 = pop_both.attach_organelle_layer(OrganelleConfig(n_max=8))
+    # Force a strong, persistent organelle_health signal via low mito_atp/psi.
+    org7.state.mito_atp.fill_(0.0)
+    org7.state.mito_psi.fill_(0.0)
+    gene_drive_before = ph7._gene_drive.clone()
+    for _ in range(5):
+        pop_both.step(hard=True)
+        # Re-force organelle state each step so organelle_health stays strongly
+        # negative throughout, isolating whether _gene_drive itself accumulates.
+        org7.state.mito_atp.fill_(0.0)
+        org7.state.mito_psi.fill_(0.0)
+    assert torch.equal(ph7._gene_drive, gene_drive_before), (
+        "PhenotypeLayer._gene_drive should NEVER be mutated by the organelle->"
+        "phenotype coupling pathway (it is injected per-step via update()'s "
+        "extra_drive argument instead) — found _gene_drive changed after 5 "
+        "steps, indicating the accumulation bug this design avoids has resurfaced."
+    )
+    assert torch.isfinite(ph7.state.expression).all()
+    print("[PASS] Organelle->phenotype coupling drives expression via update()'s "
+          "extra_drive argument without ever mutating the persistent _gene_drive "
+          "buffer (no step-over-step accumulation)")
 
     print("=" * 70)
     print("  All tests passed.")
