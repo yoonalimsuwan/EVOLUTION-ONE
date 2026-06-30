@@ -29,6 +29,6 @@ if bv_bridge.verify(tol=1e-5):
 ```
 ## Requirements
  * **Core Logic**: bv_full_theory_one.py
- * **EDA Integration**: eda_qeda_adapter_layer-2.py
+ * **EDA Integration** (with REAL FOLD ONE) : eda_qeda_adapter_layer-2.py
  * **Optimizer**: Supports AdamW and PCGrad for gradient surgery during complex material simulations.
 
