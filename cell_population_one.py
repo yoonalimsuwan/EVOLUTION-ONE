@@ -31,6 +31,20 @@
 # =============================================================================
 # CHANGELOG
 # =============================================================================
+# v1.2.0 (2026) — Effective population size + capacity-selection fairness
+#   step() now returns "n_effective": an exact, per-step Wright variance-
+#   effective population size (Ne = N / (1 + CV_k^2)) computed from
+#   realized per-cell death/division outcomes over the cells alive at the
+#   start of the step. This is a diagnostic only — the model's demographic
+#   stochasticity was already genuine (independent per-cell Bernoulli
+#   sampling), this just exposes how drift-dominated a given step/rollout
+#   was. Also fixed a hidden selection-order bias in capacity-limited
+#   division: when more cells win their division draw than there are free
+#   slots, which winners actually divide is now chosen by an unbiased
+#   random permutation instead of ascending slot-index order (the old
+#   behaviour systematically favoured low-slot-index cells whenever
+#   capacity bound, regardless of fitness).
+#
 # v1.1.0 (2026) — Organelle Layer
 #   Added OrganelleConfig / OrganelleState / OrganelleLayer: a per-cell
 #   sub-cellular layer beneath PhenotypeLayer, modelling mitochondria
@@ -231,7 +245,7 @@ except ImportError:
         "standalone mode with local fallbacks."
     )
 
-CELL_POPULATION_VERSION: str = "1.1.0"
+CELL_POPULATION_VERSION: str = "1.2.0"
 
 __all__ = [
     "CELL_POPULATION_VERSION",
@@ -1851,6 +1865,23 @@ class CellPopulation(nn.Module):
                                     sufficiency gate applied to
                                     division_rate this step — only present
                                     if an OrganelleLayer is attached.
+                "n_effective"    : (scalar) Wright variance-effective
+                                    population size for THIS step, computed
+                                    exactly from realized per-cell death/
+                                    division outcomes (see the "Effective
+                                    population size" comment in this
+                                    method's body). Diagnostic only —
+                                    reports how drift-dominated this step
+                                    was; does not feed back into the
+                                    dynamics.
+
+        Note on capacity-limited division: when more cells win their
+        division Bernoulli draw than there are free (dead) slots to place
+        offspring into, which winners actually get a slot is chosen by an
+        unbiased random permutation (not slot-index order) — see the
+        "Randomise which of the wants_to_divide cells..." comment in step
+        6 below for why an index-ordered choice would silently favour
+        low-slot-index cells regardless of fitness.
         """
         if hard is None:
             hard = not self.training
@@ -1939,6 +1970,13 @@ class CellPopulation(nn.Module):
         # behaviour.
         division_rate = division_rate * atp_gate
 
+        # Snapshot of who was alive BEFORE death/division mutate st.alive,
+        # needed below for the exact per-step effective-population-size
+        # diagnostic (n_effective) — every alive-before cell either dies
+        # (k=0), survives without dividing (k=1), or survives and divides
+        # (k=2), and that per-cell k is what n_effective is computed from.
+        alive_before_mask = st.alive.clone()
+
         # --- 5. Death --------------------------------------------------
         death_event = self._sample_bernoulli(death_rate, hard) * st.alive.to(self.cfg.dtype)
         newly_dead = (death_event > 0.5) & st.alive
@@ -1952,13 +1990,34 @@ class CellPopulation(nn.Module):
         # --- 6. Division -------------------------------------------------
         division_event = self._sample_bernoulli(division_rate, hard) * st.alive.to(self.cfg.dtype)
         wants_to_divide = (division_event > 0.5) & st.alive
-        parent_idx = torch.nonzero(wants_to_divide, as_tuple=False).flatten()
+        parent_idx_all = torch.nonzero(wants_to_divide, as_tuple=False).flatten()
 
         dead_slots = torch.nonzero(~st.alive, as_tuple=False).flatten()
-        n_divisions = min(parent_idx.numel(), dead_slots.numel())
+        n_divisions = min(parent_idx_all.numel(), dead_slots.numel())
         n_divided = 0
+        # Which alive-before cells actually got to divide, once capacity
+        # limiting (below) is resolved — used only for the n_effective
+        # diagnostic, has no effect on population dynamics itself.
+        division_realized = torch.zeros(cfg.n_max, device=device, dtype=torch.bool)
         if n_divisions > 0:
-            chosen_parents = parent_idx[:n_divisions]
+            # Randomise which of the wants_to_divide cells actually claim a
+            # free slot when division is capacity-limited (n_divisions <
+            # parent_idx_all.numel()). Previously this took an unshuffled
+            # prefix of parent_idx_all, i.e. nonzero()'s ascending slot-
+            # index order — meaning whenever capacity bound, low-slot-index
+            # cells were systematically favoured to reproduce every single
+            # time, regardless of fitness/sigma/genotype. That is a hidden
+            # selection pressure with no biological meaning, purely a
+            # tensor-layout artefact, and it silently distorts clonal
+            # competition outcomes (a clone that happens to occupy
+            # low-index slots — e.g. simply by having been seeded first —
+            # would win capacity-limited competitions more often than its
+            # actual fitness warrants). Shuffling before slicing removes
+            # this bias: which cells win a capacity-limited slot is now
+            # unbiased across slot index, exactly as it should be for
+            # among-equal-rate-winners competition.
+            perm = torch.randperm(parent_idx_all.numel(), device=device)
+            chosen_parents = parent_idx_all[perm][:n_divisions]
             chosen_slots = dead_slots[:n_divisions]
 
             jitter = torch.randn(n_divisions, 3, device=device, dtype=cfg.dtype) * cfg.motility
@@ -1969,6 +2028,7 @@ class CellPopulation(nn.Module):
             st.age[chosen_slots] = 0.0
             st.alive[chosen_slots] = True
             n_divided = n_divisions
+            division_realized[chosen_parents] = True
             if self.phenotype is not None:
                 self.phenotype.inherit_slots(chosen_parents, chosen_slots)
             if self.organelle is not None:
@@ -1976,6 +2036,31 @@ class CellPopulation(nn.Module):
                 self.organelle.charge_division_cost(chosen_parents)
 
         n_after = st.n_alive()
+
+        # --- 7. Effective population size (demographic-stochasticity
+        # diagnostic) -----------------------------------------------------
+        # NOTE: this does NOT "add" drift to the model — the independent
+        # per-cell Bernoulli sampling in steps 5-6 above already IS genuine
+        # demographic stochasticity; drift emerges from it exactly the way
+        # it does in any individual-based birth-death model. What this
+        # computes is Wright's variance-effective population size,
+        # Ne = N / (1 + CV_k^2), from the *realized* per-cell outcome
+        # k_i in {0, 1, 2} this step (0 = died, 1 = survived without
+        # dividing, 2 = survived and divided) over the cells alive at the
+        # start of this step — an exact per-step value (not the aggregate
+        # Poisson-rate approximation used as a fallback in
+        # structural_gno_evolution_bv_standalone.py's
+        # estimate_effective_population_size, for callers that only have
+        # step-level totals rather than per-cell outcomes). Reported
+        # alongside n_alive_after purely as a diagnostic; nothing above
+        # depends on it.
+        k = alive_before_mask.to(cfg.dtype) * (1.0 - newly_dead.to(cfg.dtype))
+        k = k + division_realized.to(cfg.dtype)  # +1 more if it also divided
+        n_ref = alive_before_mask.sum().clamp_min(1).to(cfg.dtype)
+        mean_k = (k * alive_before_mask.to(cfg.dtype)).sum() / n_ref
+        var_k = ((k - mean_k) ** 2 * alive_before_mask.to(cfg.dtype)).sum() / n_ref
+        cv_k_sq = var_k / mean_k.clamp_min(1e-6) ** 2
+        n_effective = n_ref / (1.0 + cv_k_sq)
 
         result = {
             "n_alive_before": torch.tensor(n_before, device=device),
@@ -1986,6 +2071,7 @@ class CellPopulation(nn.Module):
             "death_rate":     death_rate,
             "phenotype_term": phenotype_term,
             "organelle_term": organelle_term,
+            "n_effective":    n_effective.detach(),
         }
         if self.phenotype is not None:
             result["phenotype_state"] = self.phenotype.state.expression
