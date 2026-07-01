@@ -2559,6 +2559,7 @@ class CellPopulationTrainingBridge:
         rate_steps: List[torch.Tensor] = []
         organelle_health_steps: List[torch.Tensor] = []
         atp_steps: List[torch.Tensor] = []
+        ne_steps: List[float] = []
         n_divided_total = 0
         n_died_total = 0
 
@@ -2573,6 +2574,16 @@ class CellPopulationTrainingBridge:
             n_divided_total += int(step_out["n_divided"].item())
             n_died_total    += int(step_out["n_died"].item())
             mu_steps.append(self.population.population_mutation_load())
+
+            # cell_population_one >= v1.2.0 returns an exact, per-step
+            # effective population size computed from realized per-cell
+            # death/division outcomes (see its step() docstring) — prefer
+            # this over the aggregate Poisson-rate proxy in
+            # estimate_effective_population_size below whenever it's
+            # available, since it's exact rather than approximated from
+            # rollout-level totals.
+            if "n_effective" in step_out:
+                ne_steps.append(float(step_out["n_effective"].item()))
 
             div_rate = step_out["division_rate"]
             alive_f  = alive_before.to(div_rate.dtype)
@@ -2607,12 +2618,22 @@ class CellPopulationTrainingBridge:
                 self.phenotype.state.expression * alive_final.unsqueeze(-1)
             ).sum(dim=0) / n_alive_final
 
-        # Diagnostic-only, non-differentiable: purely a function of the
-        # already-recorded integer counts above (see
-        # estimate_effective_population_size's docstring / section 14.5a).
-        ne = estimate_effective_population_size(
-            n_alive_trace, n_divided_total, n_died_total
-        )
+        # Diagnostic-only, non-differentiable. If cell_population_one
+        # exposed exact per-step n_effective values, aggregate them via
+        # the HARMONIC mean — the standard result for a temporally
+        # fluctuating effective population size (Ne over T generations is
+        # dominated by the generations with the smallest Ne, exactly as a
+        # harmonic mean is, unlike an arithmetic mean which would let a
+        # single high-Ne step mask several drift-dominated ones). Falls
+        # back to the coarser aggregate proxy (section 14.5a) only for
+        # older cell_population_one versions that don't return
+        # "n_effective" yet.
+        if ne_steps:
+            ne = len(ne_steps) / sum(1.0 / max(v, 1e-6) for v in ne_steps)
+        else:
+            ne = estimate_effective_population_size(
+                n_alive_trace, n_divided_total, n_died_total
+            )
 
         return CellPopulationRollout(
             n_alive_trace=n_alive_trace,
