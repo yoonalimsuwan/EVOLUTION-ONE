@@ -2051,6 +2051,21 @@ class CellPopulationRollout:
                            over currently-alive cells at rollout end —
                            diagnostic only. ``None`` if no PhenotypeLayer
                            is attached.
+        effective_population_size : Wright variance-effective population
+                           size (Ne) estimated from this rollout's own
+                           n_alive_trace / division / death counts — see
+                           ``estimate_effective_population_size``. This is
+                           a diagnostic (non-differentiable, aggregate-
+                           level) flag for HOW DRIFT-DOMINATED this
+                           particular small-N rollout was, NOT a claim
+                           that cellpop_n_max is a realistic stand-in for
+                           a tumour/epidemiological population size (it is
+                           not — see section 14.5b docstring below). Use
+                           this to decide whether ``rate_trace`` is safe
+                           to fit directly (Ne close to census N: fairly
+                           trustworthy) or should go through
+                           ``loss_population_rate_match_finite_size``
+                           instead (Ne << N: drift-dominated, noisy).
     """
     n_alive_trace:     List[int]
     mu_trace:          torch.Tensor
@@ -2061,6 +2076,7 @@ class CellPopulationRollout:
     organelle_health_trace: Optional[torch.Tensor] = None
     atp_trace:              Optional[torch.Tensor] = None
     phenotype_expr_final:   Optional[torch.Tensor] = None
+    effective_population_size: Optional[float] = None
 
     def summary(self) -> str:
         base = (
@@ -2074,6 +2090,13 @@ class CellPopulationRollout:
             base += (
                 f"  organelle_health_final={self.organelle_health_trace[-1].item():.4f}"
                 f"  mean_atp_final={self.atp_trace[-1].item():.4f}"
+            )
+        if self.effective_population_size is not None:
+            n_census = self.n_alive_trace[-1] if self.n_alive_trace else 0
+            base += (
+                f"  Ne={self.effective_population_size:.1f}"
+                f" (census N={n_census}, Ne/N="
+                f"{self.effective_population_size / max(n_census, 1):.2f})"
             )
         return base
 
@@ -2142,6 +2165,179 @@ def loss_population_rate_match(
     if target.dim() == 0:
         target = target.expand_as(rate_trace)
     return F.mse_loss(rate_trace, target)
+
+
+# =============================================================================
+# 14.5a  Finite-size (small-N) scaling correction for Mode 4
+# =============================================================================
+#
+# CellPopulationRollout runs on n_max ~ O(10-500) agents, several orders of
+# magnitude below a real tumour/epidemiological population (~1e9-1e12
+# cells). That is fine as a CHEAP DIFFERENTIABLE TRAINING SIGNAL (see the
+# section-14.5 docstring above) — but its raw statistics (rate_trace,
+# mu_trace, clone_freq_final) are NOT directly comparable to population-
+# genetics quantities measured at realistic scale, because genetic-drift
+# strength scales as ~1/Ne: a small-N rollout sits in a drift-dominated
+# regime where a real, large population would be selection-dominated.
+# Feeding a drift-dominated small-N rate_trace into
+# ``loss_population_rate_match`` as if it were a noise-free estimate of
+# large-N behaviour silently drops this effect.
+#
+# This section adds a diagnostic effective-population-size (Ne) estimate
+# and a drift-aware loss that down-weights rollout steps in proportion to
+# their expected Wright-Fisher sampling variance at that Ne, instead of
+# fitting the noisy small-N trace at full weight everywhere.
+#
+# SCOPE / LIMITATION — read before relying on this for anything beyond
+# training-signal weighting: this corrects how small-N *statistics* are
+# interpreted and weighted downstream. It does NOT alter the underlying
+# stochastic division/death sampling itself, which lives inside
+# ``CellPopulation.step()`` in ``cell_population_one.py`` (a separate file,
+# not modified here). If ``cellpop_n_max`` is meant to stand in for a
+# realistic tumour/epidemiological population size rather than a cheap
+# training-signal proxy, the deeper fix is either (a) raising
+# ``cellpop_n_max`` toward the real regime, or (b) implementing an
+# analogous Ne-aware correction *inside* ``CellPopulation.step()``'s own
+# division/death sampling — which requires editing ``cell_population_one.py``
+# directly.
+# =============================================================================
+
+def estimate_effective_population_size(
+    n_alive_trace: List[int],
+    n_divided_total: int,
+    n_died_total: int,
+) -> float:
+    """
+    Wright's variance-effective population size, Ne = N / (1 + CV_k^2),
+    where CV_k is the coefficient of variation of per-individual
+    reproductive success k (Wright, 1938). Ne -> N in the low-variance /
+    stable-turnover limit, and Ne << N when division/death events are
+    bursty relative to the rollout's population size — the regime a short,
+    small-N ``CellPopulationRollout`` is typically in.
+
+    This is a COARSE, AGGREGATE-LEVEL proxy: CellPopulationRollout records
+    per-step totals (``n_divided_total``, ``n_died_total``), not per-cell
+    lineage-level offspring counts, so CV_k^2 here is estimated from the
+    mean per-individual event rate via the standard Poisson-process
+    approximation (Var(k) ~ mean(k) for rare independent per-cell events
+    per step), not measured directly from individual reproductive
+    histories. Adequate for flagging "how drift-dominated is this
+    rollout" for loss-weighting purposes; not a substitute for a proper
+    lineage-tracing demographic estimate.
+
+    Args:
+        n_alive_trace   : population size after each rollout step (from
+                           ``CellPopulationRollout.n_alive_trace``).
+        n_divided_total : total divisions summed across the rollout.
+        n_died_total     : total deaths summed across the rollout.
+
+    Returns:
+        Estimated effective population size Ne (float, >= 1.0). Falls
+        back to the census mean population size (no drift correction)
+        if there is no recorded turnover to estimate variance from.
+    """
+    if not n_alive_trace:
+        return 1.0
+    n_mean = sum(n_alive_trace) / len(n_alive_trace)
+    if n_mean <= 0:
+        return 1.0
+
+    n_steps = len(n_alive_trace)
+    total_events = n_divided_total + n_died_total
+    if total_events == 0:
+        # No turnover recorded -> nothing to estimate reproductive-success
+        # variance from; fall back to the census size uncorrected.
+        return max(n_mean, 1.0)
+
+    mean_event_rate = total_events / (n_mean * n_steps)  # per cell, per step
+    cv_k_sq = 1.0 / max(mean_event_rate * n_steps, 1e-6)
+    ne = n_mean / (1.0 + cv_k_sq)
+    return max(ne, 1.0)
+
+
+def drift_adjusted_rate_target_std(
+    ne: float,
+    rate_target: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Theoretical per-step sampling std of a division-rate estimate drawn
+    from a population of effective size ``ne``, i.e. sqrt(p(1-p)/Ne) for a
+    target rate p — the Wright-Fisher-style spread a rate_trace at this Ne
+    should be expected to show even if the GNO's underlying phase-field
+    prediction is exactly "correct" in the large-N limit.
+
+    Args:
+        ne          : effective population size, e.g. from
+                       ``estimate_effective_population_size``.
+        rate_target : (T,) or scalar target division-rate trajectory.
+
+    Returns:
+        Tensor the same shape as ``rate_target``, giving per-step std.
+    """
+    p = rate_target.clamp(1e-4, 1.0 - 1e-4)
+    return torch.sqrt(p * (1.0 - p) / max(float(ne), 1.0))
+
+
+def loss_population_rate_match_finite_size(
+    rate_trace: torch.Tensor,
+    rate_target: torch.Tensor,
+    n_alive_trace: List[int],
+    n_divided_total: int,
+    n_died_total: int,
+    min_relative_weight: float = 0.1,
+) -> torch.Tensor:
+    """
+    Finite-size-aware replacement for ``loss_population_rate_match``.
+
+    Reweights the per-step squared error by the inverse of the theoretical
+    Wright-Fisher sampling variance at the rollout's estimated Ne (see
+    ``estimate_effective_population_size`` / ``drift_adjusted_rate_target_std``),
+    so rollout steps expected to be drift-dominated (large sampling std at
+    low Ne) contribute proportionally less to the loss than steps whose
+    statistics are more trustworthy — rather than fitting a drift-
+    dominated small-N trace as if every step were an equally reliable,
+    noise-free estimate of large-N behaviour (see the section-14.5a module
+    docstring above for the full rationale and scope/limitations).
+
+    Prefer this over ``loss_population_rate_match`` whenever
+    ``CellPopulationRollout.effective_population_size`` is substantially
+    below the census population size (Ne/N << 1) — the ``summary()``
+    string on the rollout result reports this ratio directly.
+
+    Args:
+        rate_trace          : (T,) differentiable division-rate trace,
+                               same tensor ``loss_population_rate_match``
+                               consumes.
+        rate_target         : (T,) or scalar target division-rate
+                               trajectory.
+        n_alive_trace       : population size after each rollout step
+                               (from ``CellPopulationRollout.n_alive_trace``).
+        n_divided_total     : total divisions across the rollout (from
+                               ``CellPopulationRollout.n_divided_total``).
+        n_died_total        : total deaths across the rollout (from
+                               ``CellPopulationRollout.n_died_total``).
+        min_relative_weight : floor on the per-step weight relative to the
+                               highest-confidence step, so no step is ever
+                               driven to exactly zero contribution.
+
+    Returns:
+        Scalar weighted-MSE loss tensor. Differentiable w.r.t.
+        ``rate_trace`` exactly as ``loss_population_rate_match`` is — the
+        per-step weights are built entirely from detached, non-
+        differentiable count data (Ne estimate + target values), so they
+        introduce no new gradient path into ``pred_u``.
+    """
+    target = rate_target.to(device=rate_trace.device, dtype=rate_trace.dtype)
+    if target.dim() == 0:
+        target = target.expand_as(rate_trace)
+
+    ne = estimate_effective_population_size(n_alive_trace, n_divided_total, n_died_total)
+    std = drift_adjusted_rate_target_std(ne, target.detach())  # (T,), no grad path
+    inv_var = 1.0 / (std * std).clamp_min(1e-8)
+    weight = (inv_var / inv_var.max()).clamp_min(min_relative_weight)
+
+    sq_err = (rate_trace - target) ** 2
+    return (weight * sq_err).mean()
 
 
 # =============================================================================
@@ -2411,6 +2607,13 @@ class CellPopulationTrainingBridge:
                 self.phenotype.state.expression * alive_final.unsqueeze(-1)
             ).sum(dim=0) / n_alive_final
 
+        # Diagnostic-only, non-differentiable: purely a function of the
+        # already-recorded integer counts above (see
+        # estimate_effective_population_size's docstring / section 14.5a).
+        ne = estimate_effective_population_size(
+            n_alive_trace, n_divided_total, n_died_total
+        )
+
         return CellPopulationRollout(
             n_alive_trace=n_alive_trace,
             mu_trace=mu_trace,
@@ -2421,6 +2624,7 @@ class CellPopulationTrainingBridge:
             organelle_health_trace=organelle_health_trace,
             atp_trace=atp_trace,
             phenotype_expr_final=phenotype_expr_final,
+            effective_population_size=ne,
         )
 
     def organelle_health_and_boost(
