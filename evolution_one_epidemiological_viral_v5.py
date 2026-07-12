@@ -2,7 +2,7 @@
 # EVOLUTION ONE v5 : High‑Performance Epidemiological Forecasting
 # & Viral Evolution Engine
 # =============================================================================
-# Author  : Yoon A Limsuwan / MSPS NETWORK
+# Author  : PAI , Yoon A Limsuwan / MSPS NETWORK
 # ORCID   : 0009-0008-2374-0788
 # GitHub  : yoonalimsuwan
 # License : MIT
