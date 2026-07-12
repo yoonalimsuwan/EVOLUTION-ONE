@@ -1,7 +1,7 @@
 # =============================================================================
 # EVOLUTION ONE v4 – Multi‑Level Cancer Evolution & Structural Impact Engine
 # =============================================================================
-# Author  : Yoon A Limsuwan / MSPS NETWORK
+# Author  : PAI , Yoon A Limsuwan / MSPS NETWORK
 # ORCID   : 0009-0008-2374-0788
 # GitHub  : yoonalimsuwan
 # License : MIT
