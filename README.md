@@ -334,7 +334,7 @@ Citing Evolution ONE
 If you use this software, please cite:
 
 `
-Yoon A Limsuwan. "Evolution ONE: Multi‑Level Cancer Evolution & Structural Impact Engine And Epidemiology."
+PAI , Yoon A Limsuwan. "Evolution ONE: Multi‑Level Cancer Evolution & Structural Impact Engine And Epidemiology."
 Zenodo, 2026.
 https://doi.org/10.5281/zenodo.21198770
 ```
@@ -349,7 +349,7 @@ This project is licensed under the MIT License – see LICENSE for details.
 
 Contact
 
-Yoon A Limsuwan – GitHub
+PAI , Yoon A Limsuwan – GitHub
 Project link: https://github.com/yoonalimsuwan/EVOLUTION-ONE
 
 ```
