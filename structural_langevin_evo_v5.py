@@ -1,7 +1,7 @@
 # =============================================================================
 # LANGEVIN ADVANCED WITH STRUCTURAL CALCULUS  (v5)
 # =============================================================================
-# Developer  : Yoon A Limsuwan / MSPS NETWORK
+# Developer  : PAI , Yoon A Limsuwan / MSPS NETWORK
 # ORCID      : 0009-0008-2374-0788
 # GitHub     : yoonalimsuwan
 # License    : MIT
