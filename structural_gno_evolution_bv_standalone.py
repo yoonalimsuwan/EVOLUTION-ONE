@@ -1,7 +1,7 @@
 # =============================================================================
 # STRUCTURAL GNO EVOLUTION  —  BV EDITION (STANDALONE, SINGLE-FILE)
 # =============================================================================
-# Developer    : Yoon A Limsuwan / MSPS NETWORK
+# Developer    : PAI , Yoon A Limsuwan / MSPS NETWORK
 #                MY SOUL MOVE BY POWER OF HOLY SPIRIT
 # Organization : MSPS NETWORK
 # ORCID        : 0009-0008-2374-0788
