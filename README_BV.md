@@ -7,7 +7,7 @@
 | **Module** | `bv_full_theory_one.py` |
 | **Version** | 1.0.0 |
 | **Ecosystem version** | EVOLUTION_VERSION 3.0.0 |
-| **Author** | Yoon A Limsuwan / MSPS NETWORK |
+| **Author** | PAI , Yoon A Limsuwan / MSPS NETWORK |
 | **ORCID** | 0009-0008-2374-0788 |
 | **GitHub** | yoonalimsuwan |
 | **Contact** | msps4u@gmail.com |
