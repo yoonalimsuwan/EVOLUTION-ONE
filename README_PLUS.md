@@ -53,7 +53,7 @@ EVOLUTION ONE Cluster  (v3.0.0)
 ├── structural_cahn_hilliard_3d_v3.py ← Phase-field / CH3D PDE engine
 │     └── imports from one_core_evolution_v3 (preferred) or one_core (fallback)
 │
-└── structural_gno_evolution.py       ← GNO surrogate (all three modes)
+└──  structural_gno_evolution_bv_standalone.py    ← GNO surrogate (all three modes)
       └── optional import from one_core_evolution_v3
 ```
 
@@ -412,7 +412,7 @@ Computes Δ_Sⁿ u recursively; exposed for use by `one_core.py` and other clust
 
 ---
 
-### 6. `structural_gno_evolution.py`
+### 6. `structural_gno_evolution_bv_standalone.py`
 **STRUCTURAL GNO EVOLUTION — Graph Neural Operator Surrogate**
 Production Release · ~1,403 lines · `SGNO_VERSION`
 
@@ -480,7 +480,7 @@ Total loss = λ_evo·L_evo + λ_cls·L_cls     # Mode 1
 #### Minimal Training Example
 
 ```python
-from structural_gno_evolution import SGNOEvoConfig, StructuralGNOEvolution, SGNOEvolutionTrainer, get_device
+from structural_gno_evolution_bv_standalone import SGNOEvoConfig, StructuralGNOEvolution, SGNOEvolutionTrainer, get_device
 
 cfg     = SGNOEvoConfig(hidden_dim=128, num_layers=6, max_epochs=200)
 model   = StructuralGNOEvolution(cfg)
@@ -615,7 +615,7 @@ mu      = bridge.project_to_mu(u_field)  # → mutation load μ ∈ (0, 1)
 ### GNO Surrogate Inference
 
 ```python
-from structural_gno_evolution import StructuralGNOEvolution, SGNOEvoConfig, BatchData
+from structural_gno_evolution_bv_standalone import StructuralGNOEvolution, SGNOEvoConfig, BatchData
 
 cfg   = SGNOEvoConfig()
 model = StructuralGNOEvolution(cfg)
