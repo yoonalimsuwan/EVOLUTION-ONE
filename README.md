@@ -325,6 +325,87 @@ EVOLUTION_ONE (Epidemiology Architecture)
 ## Academic & Open Science Foundation
 EVOLUTION ONE is built upon an original interdisciplinary framework utilizing proprietary systems of **Structural Calculus** and **Regime Calculus**. This epidemiological translation acts as a deterministic verification platform for modeling complex, non-linear biological systems under real-world clinical and structural stress tests.
 
+```
+
+# Evolution ONE — Standalone Ageing & Longevity Engine
+
+A production-grade, 100% differentiable PyTorch framework for biological age trajectory estimation, higher-order tissue entropy modeling, and non-explosive cellular rejuvenation optimization.
+
+---
+
+## Key Features
+
+* **Universal Tensor Compression ($\Phi_U$):** Maps high-dimensional multi-omic decay markers into a compact invariant subspace $\mathcal{V} = \mathbb{R}^{d(m,n)}$.
+* **8th-Order Polyharmonic PDE Dynamics ($\Delta^4_{\mathcal{R}}$):** Models spatial-temporal tissue integrity dissipation under Lopatinski-Shapiro boundary conditions ($\det M(\xi') = 12$).
+* **Canonical Bottleneck No-Zeno Resets:** Enforces an explicit physical energy threshold ($\Delta E_{\mathrm{in}} \ge c_V c \pi \ell_c^2 > 0$) to guarantee non-explosive cellular rejuvenation.
+* **Native Autograd Integration:** Pure PyTorch operations with zero external biology wrapper dependencies, ensuring zero computational graph breaks during optimization.
+
+---
+
+## Mathematical Architecture
+
+### 1. Universal Contraction Operator ($\Phi_U$)
+$$\Phi_U(S) = \left[ \bigoplus_{i=1}^{m} (C_i \otimes \Delta_i) \right] \oplus \left[ \bigoplus_{i=1}^{m} \Gamma_i \right]$$
+
+Dimensionality scaling obeys $d(m,n) = m^2 n^2 + m n^2 \le C m^3 n^2$.
+
+### 2. 8th-Order Spatial Decay PDE
+$$\frac{\partial u}{\partial t} = -\alpha \Delta^4_{\mathcal{R}} u - \beta \nabla \mathcal{E}(u) + \sum_{k} \delta(t - T_k) \mathcal{R}_{\mathrm{reset}}(u)$$
+
+### 3. Small-Time Exit Probability $q(\varepsilon)$
+$$P(\tau_k < \varepsilon \mid \mathcal{F}_{T_k}) \le q(\varepsilon) = C \exp\left( -\frac{\kappa^2 \Delta E_{\mathrm{in}}^2}{C_1 \varepsilon + C_2 \varepsilon^2} \right)$$
+
+---
+
+## Quick Start
+
+```python
+import torch
+from evolution_one_ageing import DifferentiableLongevityEngine
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Initialize Engine
+engine = DifferentiableLongevityEngine(in_features=64, m=4, n=4, spatial_dim=32).to(device)
+
+# Input Tensors: Batch of 16 Patients with 64 Multi-Omic Markers
+patient_omics = torch.randn(16, 64, device=device, requires_grad=True)
+spatial_integrity = torch.ones(16, 32, device=device)
+therapeutics = torch.ones(16, 1, device=device)  # Rejuvenation pulse signal
+
+# Execute Forward Pass
+results = engine(patient_omics, spatial_integrity, therapeutics)
+
+# Compute Loss & Optimization Backpropagation
+loss = results["bio_age_projected"].mean() + 0.1 * results["structural_drift_d_str"].mean()
+loss.backward()
+
+print(f"Initial Bio-Age   : {results['bio_age_initial'].mean().item():.2f} years")
+print(f"Projected Bio-Age : {results['bio_age_projected'].mean().item():.2f} years")
+print(f"Gradient Norm     : {patient_omics.grad.norm().item():.6f}")
+```
+
+---
+
+## Engine Output Contract
+
+| Return Key | Tensor Type | Description |
+| :--- | :--- | :--- |
+| `phi_U_initial` | `torch.Tensor` | Invariant tensor representation in bounded subspace $B_R(0)$. |
+| `phi_U_post` | `torch.Tensor` | Rejuvenated tensor state after applying No-Zeno guarded reset. |
+| `bio_age_initial` | `torch.Tensor` | Baseline biological age estimate ($0–100$ years). |
+| `bio_age_projected` | `torch.Tensor` | Predicted biological age following decay and interventions. |
+| `structural_drift_d_str` | `torch.Tensor` | Frobenius distance metric drift between pre- and post-states. |
+| `spatial_decay_field` | `torch.Tensor` | $\Delta^4_{\mathcal{R}}$ polyharmonic spatial field state. |
+| `reset_executed` | `torch.Tensor` | Binary mask flagging successful reset activation ($\Delta E_{\mathrm{in}}$ met). |
+
+---
+
+## System Requirements
+
+* Python `3.10+`
+* PyTorch `2.0.0+` (CUDA recommended for high-batch tensor operations)
+
 
 ---
 ```
