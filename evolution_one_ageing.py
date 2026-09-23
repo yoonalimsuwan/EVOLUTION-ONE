@@ -1,6 +1,6 @@
 # =============================================================================
 # EVOLUTION ONE -- Standalone Ageing & Longevity Module (Production Edition v2)
-# Author  : Yoon A. Limsuwan / MSPS NETWORK
+# Author  : PAI AND Yoon A. Limsuwan / MSPS NETWORK
 # Engine  : Native PyTorch, fully differentiable, built directly on top of
 #           structural_calculus_ops.py rather than re-implementing any of it.
 # Math    : Iterated structural Laplacian D^S(8) = d_n(L^4 u), spectral
