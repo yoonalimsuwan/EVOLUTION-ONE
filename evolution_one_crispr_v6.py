@@ -5,7 +5,15 @@ Differentiable CRISPR-Cas Therapeutic Design Engine
 Built on: one_core_evolution, structural_calculus_ops,
           evolution_one_ageing, evolution_one_v4, epi_v5
 
-Covers: NF1 (ท้าวแสนปม), Down syndrome (สังทอง), congenital diabetes,
+# Developer    : PAI ,Yoon A Limsuwan / MSPS NETWORK
+#                MY SOUL MOVE BY POWER OF HOLY SPIRIT
+# Organization : MSPS NETWORK
+# ORCID        : 0009-0008-2374-0788
+# GitHub       : yoonalimsuwan
+# License      : MIT
+# Year         : 2026
+
+Covers: NF1 , Down syndrome , congenital diabetes,
         congenital heart disease (LZTR1/Noonan), cerebral palsy (GNAO1),
         disorders of sex development (SRY/SOX9), CF, DMD, SMA,
         beta-thalassemia, sickle cell, GJB2 deafness, LCA,
