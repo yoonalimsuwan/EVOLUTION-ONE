@@ -1,0 +1,106 @@
+# diseases.yaml — external registry for evolution_one_crispr_v7
+# Load with:  registry.load_yaml("diseases.yaml")
+diseases:
+  - key: huntington
+    gene: HTT
+    mutation: CAG_expansion
+    mode: TRIPLET_CONTRACTION
+    objective: reduce_HTT_aggregation
+    cell_type: 11
+    tissue: striatal_neuron
+    preferred_editor: Cas9_nickase_pair
+    delivery: AAV9_intracranial
+    repeat_unit: CAG
+    repeat_count_pathogenic: 42
+    note: "CAG repeat in HTT exon 1; contraction stalls aggregation."
+
+  - key: fragile_x
+    gene: FMR1
+    mutation: CGG_expansion
+    mode: TRIPLET_CONTRACTION
+    objective: restore_FMRP_expression
+    cell_type: 2
+    tissue: cortical_neuron
+    preferred_editor: Cas9_nickase_pair
+    delivery: AAV9
+    repeat_unit: CGG
+    repeat_count_pathogenic: 200
+
+  - key: friedreich_ataxia
+    gene: FXN
+    mutation: GAA_expansion
+    mode: TRIPLET_CONTRACTION
+    objective: restore_frataxin
+    cell_type: 1
+    tissue: dorsal_root_ganglion
+    preferred_editor: Cas9_nickase_pair
+    delivery: AAV9
+    repeat_unit: GAA
+    repeat_count_pathogenic: 100
+
+  - key: prader_willi
+    gene: 15q11-q13
+    mutation: paternal_deletion
+    mode: IMPRINTING
+    objective: restore_paternal_gene_expression
+    cell_type: 14
+    tissue: hypothalamic_neuron
+    preferred_editor: dCas9-TET1
+    delivery: AAV9
+    imprinted_allele: paternal
+
+  - key: angelman
+    gene: UBE3A
+    mutation: maternal_UBE3A_silencing
+    mode: IMPRINTING
+    objective: activate_maternal_UBE3A
+    cell_type: 2
+    tissue: hippocampal_neuron
+    preferred_editor: dCas9-VP64
+    delivery: AAV9
+    imprinted_allele: maternal
+
+  - key: melas
+    gene: MT-TL1
+    mutation: m.3243A>G
+    mode: MITOCHONDRIAL
+    objective: shift_heteroplasmy_toward_WT
+    cell_type: 0
+    tissue: oxidative_tissue
+    preferred_editor: mito-TALEN
+    delivery: AAV9
+    mtdna_heteroplasmy_threshold: 0.6
+
+  - key: dmd_large_del
+    gene: DMD
+    mutation: exon_45_52_deletion
+    mode: STRUCTURAL_VARIANT
+    objective: restore_reading_frame
+    cell_type: 1
+    tissue: skeletal_muscle
+    preferred_editor: Cas9_dual_sgRNA
+    delivery: AAV9
+    variant_size_kb: 350.0
+
+  - key: hutchinson_gilford
+    gene: LMNA
+    mutation: c.1824C>T
+    mode: EPIGENETIC
+    objective: reduce_progerin_expression
+    cell_type: 12
+    tissue: fibroblast
+    preferred_editor: dCas9-KRAB
+    delivery: LNP
+    epigenetic_mark: H3K9me3
+
+  - key: myotonic_dystrophy
+    gene: DMPK
+    mutation: CTG_expansion
+    mode: TRIPLET_CONTRACTION
+    objective: reduce_DMPK_aggregation
+    cell_type: 1
+    tissue: skeletal_muscle
+    preferred_editor: Cas9_nickase_pair
+    delivery: AAV9
+    repeat_unit: CTG
+    repeat_count_pathogenic: 500
