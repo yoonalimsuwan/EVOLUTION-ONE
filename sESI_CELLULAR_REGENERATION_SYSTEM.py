@@ -2222,7 +2222,7 @@ class SESICellularRegenerationSystem(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 20. MULTI-TASK LOSS
+# 20. MULTI-TASK LOSS (Continued)
 # ═══════════════════════════════════════════════════════════════════════
 
 class CellularRegenLoss(nn.Module):
@@ -2239,12 +2239,362 @@ class CellularRegenLoss(nn.Module):
         zero = torch.zeros((), device=dev)
         L: Dict[str, Tensor] = {}
         
-        # Regeneration score loss
+        # 1. Regeneration score loss
         if "regen_target" in batch:
             L["regen"] = F.mse_loss(out["regen_score"], batch["regen_target"])
         else:
             L["regen"] = zero
         
-        # Sobolev regularity loss (encourage smooth transitions)
-        L["sobolev"] = -out["sobolev_regular
-```
+        # 2. Sobolev regularity loss (encourage smooth transitions, penalize high norm)
+        L["sobolev"] = out["sobolev_norm"].mean() * cfg.w_sobolev
+        
+        # 3. Fractal boundary loss (encourage heterogeneity/singularity)
+        L["fractal"] = (1.0 - out["fractal_singularity_map"].mean()) * cfg.w_fractal
+        
+        # 4. HCSN measurement consistency (encourage valid probability distributions)
+        L["hcsn"] = F.kl_div(
+            F.log_softmax(out["hcsn_hmm_probs"], dim=-1), 
+            torch.ones_like(out["hcsn_hmm_probs"]) / cfg.n_outcomes, 
+            reduction="batchmean"
+        ) * cfg.w_hcsn
+        
+        # 5. Yamanaka reprogramming loss (encourage stable epigenetic age prediction)
+        if "epigenetic_age_target" in batch:
+            L["yamanaka"] = F.mse_loss(out["yamanaka_epigenetic_age"], batch["epigenetic_age_target"]) * cfg.w_yamanaka
+        else:
+            L["yamanaka"] = out["yamanaka_epigenetic_age"].mean() * 0.01 * cfg.w_yamanaka
+            
+        # 6. SPTC consciousness loss (maximize integrated information potential)
+        L["sptc"] = (1.0 - out["sptc_potentiality"].mean()) * cfg.w_sptc
+        
+        # 7. OPMC compression loss (encourage high saturation of canonical signature)
+        L["opmc"] = (1.0 - out["opmc_saturation"].mean()) * cfg.w_opmc
+        
+        # 8. SQCT collapse loss (encourage stable cell fate decisions)
+        L["sqct"] = F.kl_div(
+            F.log_softmax(out["sqct_cell_fate_probs"], dim=-1),
+            torch.ones_like(out["sqct_cell_fate_probs"]) / 5.0,
+            reduction="batchmean"
+        ) * cfg.w_sqct
+        
+        # 9. Organoid growth loss (encourage pattern formation, penalize uniformity)
+        L["organoid"] = (1.0 - out["organoid_tissue_architecture"].var()) * cfg.w_organoid
+        
+        # 10. L2 Regularization
+        reg = sum(p.pow(2).sum() for p in model.parameters() if p.requires_grad)
+        L["reg"] = reg * cfg.w_reg
+        
+        # Total Loss
+        total = sum(v for k, v in L.items() if k != "reg") + L["reg"]
+        L["total"] = total
+        
+        return L
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 21. DATASET & DATALOADERS
+# ═══════════════════════════════════════════════════════════════════════
+
+class SyntheticRegenDataset(Dataset):
+    """Synthetic dataset for cellular regeneration testing."""
+    
+    def __init__(self, cfg: CellularRegenConfig, n: int, seed: int):
+        self.cfg = cfg
+        g = torch.Generator().manual_seed(seed)
+        
+        self.h_pooled = torch.randn(n, cfg.agi_latent_dim, generator=g)
+        self.regen_target = torch.rand(n, generator=g)
+        self.epigenetic_age_target = torch.rand(n, generator=g) * 80.0 + 20.0
+        
+    def __len__(self):
+        return len(self.h_pooled)
+    
+    def __getitem__(self, idx):
+        return {
+            "h_pooled": self.h_pooled[idx],
+            "regen_target": self.regen_target[idx],
+            "epigenetic_age_target": self.epigenetic_age_target[idx],
+        }
+
+
+def build_regen_loaders(cfg: CellularRegenConfig) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """Build train, val, and test dataloaders."""
+    train_ds = SyntheticRegenDataset(cfg, cfg.n_train, cfg.data_seed)
+    val_ds = SyntheticRegenDataset(cfg, cfg.n_val, cfg.data_seed + 1)
+    test_ds = SyntheticRegenDataset(cfg, cfg.n_test, cfg.data_seed + 2)
+    
+    train_sampler = DistributedSampler(train_ds) if is_dist() else None
+    val_sampler = DistributedSampler(val_ds, shuffle=False) if is_dist() else None
+    test_sampler = DistributedSampler(test_ds, shuffle=False) if is_dist() else None
+    
+    common_kwargs = {
+        "batch_size": cfg.batch_size,
+        "num_workers": 2,
+        "pin_memory": True,
+        "persistent_workers": False,
+    }
+    
+    return (
+        DataLoader(train_ds, sampler=train_sampler, shuffle=(train_sampler is None), drop_last=True, **common_kwargs),
+        DataLoader(val_ds, sampler=val_sampler, shuffle=False, **common_kwargs),
+        DataLoader(test_ds, sampler=test_sampler, shuffle=False, **common_kwargs),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 22. TRAINER (AMP + DDP + Optimization)
+# ═══════════════════════════════════════════════════════════════════════
+
+class CellularRegenTrainer:
+    """Production trainer with AMP, DDP, and gradient checkpointing support."""
+    
+    def __init__(self, cfg: CellularRegenConfig, model: SESICellularRegenerationSystem, device: torch.device):
+        self.cfg = cfg
+        self.device = device
+        self.model = model.to(device)
+        
+        # [C5] torch.compile
+        if cfg.use_torch_compile and hasattr(torch, "compile"):
+            try:
+                self.model = torch.compile(self.model, mode="max-autotune")
+                if is_main():
+                    logger.info("torch.compile enabled (max-autotune)")
+            except Exception as e:
+                if is_main():
+                    logger.warning(f"torch.compile failed: {e}")
+                    
+        # DDP Wrapper
+        if is_dist():
+            self.model = DDP(
+                self.model,
+                device_ids=[device.index] if device.type == "cuda" else None,
+                find_unused_parameters=False,
+                gradient_as_bucket_view=True,
+            )
+            
+        self.loss_fn = CellularRegenLoss(cfg)
+        
+        # AMP Setup
+        amp_dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+        self._amp_dtype = amp_dtype_map.get(cfg.amp_dtype, torch.float32)
+        self._amp_on = cfg.amp_dtype != "fp32" and device.type == "cuda"
+        self.scaler = _GradScaler(enabled=(self._amp_on and self._amp_dtype == torch.float16))
+        
+        # [C5] Fused AdamW
+        fused = cfg.use_fused_adamw and device.type == "cuda"
+        self.opt = torch.optim.AdamW(
+            [p for p in self._raw().parameters() if p.requires_grad],
+            lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95), fused=fused,
+        )
+        
+        self.step = 0
+        
+    def _raw(self) -> nn.Module:
+        return self.model.module if isinstance(self.model, DDP) else self.model
+        
+    def _lr_schedule(self) -> float:
+        cfg = self.cfg
+        if self.step < cfg.warmup_steps:
+            return cfg.lr * (self.step + 1) / max(1, cfg.warmup_steps)
+        prog = (self.step - cfg.warmup_steps) / max(1, cfg.max_steps - cfg.warmup_steps)
+        prog = min(1.0, max(0.0, prog))
+        return cfg.lr * (cfg.min_lr_ratio + (1 - cfg.min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * prog)))
+        
+    def train_step(self, batch: Dict[str, Tensor]) -> Dict[str, float]:
+        cfg = self.cfg
+        self.model.train()
+        batch = {k: v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v for k, v in batch.items()}
+        
+        for g in self.opt.param_groups:
+            g["lr"] = self._lr_schedule()
+            
+        if (self.step + 1) % cfg.grad_accum == 0:
+            self.opt.zero_grad(set_to_none=True)
+            
+        with amp_ctx(self._amp_on, self._amp_dtype, self.device.type):
+            out = self.model(batch["h_pooled"])
+            losses = self.loss_fn(out, batch, self._raw())
+            loss = losses["total"] / cfg.grad_accum
+            
+        self.scaler.scale(loss).backward()
+        
+        if (self.step + 1) % cfg.grad_accum == 0:
+            self.scaler.unscale_(self.opt)
+            torch.nn.utils.clip_grad_norm_([p for p in self._raw().parameters() if p.requires_grad], cfg.grad_clip)
+            self.scaler.step(self.opt)
+            self.scaler.update()
+            self.opt.zero_grad(set_to_none=True)
+            
+        self.step += 1
+        return {k: float(v) for k, v in losses.items() if torch.is_tensor(v) and v.numel() == 1}
+        
+    @torch.no_grad()
+    def evaluate(self, loader: DataLoader) -> Dict[str, float]:
+        self.model.eval()
+        tot: Dict[str, float] = {}
+        n = 0
+        for batch in loader:
+            batch = {k: v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v for k, v in batch.items()}
+            with amp_ctx(self._amp_on, self._amp_dtype, self.device.type):
+                out = self.model(batch["h_pooled"])
+                losses = self.loss_fn(out, batch, self._raw())
+            bs = batch["h_pooled"].shape[0]
+            for k, v in losses.items():
+                if torch.is_tensor(v) and v.numel() == 1:
+                    tot[k] = tot.get(k, 0.0) + float(v) * bs
+            n += bs
+            
+        for k in tot:
+            tot[k] /= max(1, n)
+            
+        if is_dist():
+            for k in list(tot.keys()):
+                tot[k] = float(all_reduce_mean(torch.tensor(tot[k], device=self.device)))
+        tot["n"] = n
+        return tot
+        
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "model": self._raw().state_dict(),
+            "opt": self.opt.state_dict(),
+            "scaler": self.scaler.state_dict(),
+            "step": self.step,
+        }
+        
+    def load_state_dict(self, sd: Dict[str, Any]):
+        self._raw().load_state_dict(sd["model"])
+        self.opt.load_state_dict(sd["opt"])
+        try:
+            self.scaler.load_state_dict(sd["scaler"])
+        except Exception:
+            pass
+        self.step = sd["step"]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 23. MAIN EXECUTION & SMOKE TEST
+# ═══════════════════════════════════════════════════════════════════════
+
+def run_smoke_test():
+    """Verify gradient flow and module integration."""
+    print("=" * 72)
+    print(" SESI Cellular Regeneration System — Smoke Test")
+    print("=" * 72)
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"  Device: {device}")
+    
+    cfg = CellularRegenConfig(
+        agi_latent_dim=64,
+        carpet_level=2,
+        carpet_n_cells=8 ** 2,
+        organoid_grid_size=4,
+        batch_size=2,
+        gradient_checkpointing=False,
+        use_torch_compile=False,
+    )
+    
+    model = SESICellularRegenerationSystem(cfg).to(device)
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Trainable parameters: {n_params:,}")
+    
+    B = 2
+    h_pooled = torch.randn(B, cfg.agi_latent_dim, device=device, requires_grad=True)
+    batch = {
+        "h_pooled": h_pooled,
+        "regen_target": torch.rand(B, device=device),
+        "epigenetic_age_target": torch.rand(B, device=device) * 60.0 + 20.0,
+    }
+    
+    loss_fn = CellularRegenLoss(cfg)
+    
+    with amp_ctx(False, torch.float32, device.type):
+        out = model(batch["h_pooled"])
+        losses = loss_fn(out, batch, model)
+        loss = losses["total"]
+        
+    loss.backward()
+    
+    print("-" * 72)
+    print(f"  Total loss: {loss.item():.6f}")
+    print(f"  Regen score shape: {tuple(out['regen_score'].shape)}")
+    print(f"  Organoid architecture shape: {tuple(out['organoid_tissue_architecture'].shape)}")
+    
+    grad_ok = all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters() if p.requires_grad)
+    print(f"  Autograd: {'PASS — FULLY CONNECTED' if grad_ok else 'FAILED'}")
+    print("=" * 72)
+
+
+def run_train(cfg: CellularRegenConfig, device: torch.device):
+    """Main training loop."""
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    train_dl, val_dl, _ = build_regen_loaders(cfg)
+    
+    model = SESICellularRegenerationSystem(cfg)
+    trainer = CellularRegenTrainer(cfg, model, device)
+    
+    if is_main():
+        n_params = sum(p.numel() for p in trainer._raw().parameters() if p.requires_grad)
+        logger.info(f"Trainable parameters: {n_params:,}")
+        logger.info(f"AMP: {cfg.amp_dtype}, Compile: {cfg.use_torch_compile}")
+        
+    best_loss = float("inf")
+    t0 = time.time()
+    
+    while trainer.step < cfg.max_steps:
+        for batch in train_dl:
+            logs = trainer.train_step(batch)
+            
+            if is_main() and trainer.step % cfg.log_every == 0:
+                elapsed = time.time() - t0
+                log_str = " ".join(f"{k}={v:.4f}" for k, v in logs.items())
+                logger.info(f"step {trainer.step:6d} | {log_str} | lr={trainer._lr_schedule():.2e} | {elapsed:.1f}s")
+                
+            if trainer.step % cfg.eval_every == 0 and trainer.step > 0:
+                ev = trainer.evaluate(val_dl)
+                if is_main():
+                    logger.info("  [val] " + " ".join(f"{k}={v:.4f}" for k, v in ev.items() if k != "n"))
+                    if ev.get("total", float("inf")) < best_loss:
+                        best_loss = ev["total"]
+                        torch.save(trainer.state_dict(), os.path.join(cfg.out_dir, "best.pt"))
+                        
+            if is_main() and trainer.step % cfg.ckpt_every == 0:
+                torch.save(trainer.state_dict(), os.path.join(cfg.out_dir, f"ckpt_{trainer.step}.pt"))
+                
+            if trainer.step >= cfg.max_steps:
+                break
+                
+    if is_main():
+        torch.save(trainer.state_dict(), os.path.join(cfg.out_dir, "ckpt_final.pt"))
+        logger.info(f"Training complete. Best val loss: {best_loss:.6f}")
+
+
+def main():
+    parser = argparse.ArgumentParser("SESI Cellular Regeneration System")
+    parser.add_argument("--mode", choices=["smoke", "train"], default="smoke")
+    parser.add_argument("--steps", type=int, default=None)
+    parser.add_argument("--out", type=str, default=None)
+    args = parser.parse_args()
+    
+    logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s — %(message)s")
+    
+    device, r, ws = setup_dist()
+    seed_all(42)
+    
+    cfg = CellularRegenConfig()
+    if args.steps is not None:
+        cfg.max_steps = args.steps
+    if args.out is not None:
+        cfg.out_dir = args.out
+    cfg.device = str(device)
+    
+    if args.mode == "smoke":
+        run_smoke_test()
+    elif args.mode == "train":
+        run_train(cfg, device)
+        
+    cleanup_dist()
+
+
+if __name__ == "__main__":
+    main()
