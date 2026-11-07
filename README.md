@@ -1,5 +1,5 @@
 ``
-# Evolution ONE 32 Medical AGI
+# Evolution ONE 37 Medical AGI
 
 **Multi‑Level Cancer Evolution & Structural Impact Engine , Ageing & Longevity Module , High-Performance Epidemiological Forecasting & Viral Evolution Engine  , CRISPR-Cas Therapeutic Design  **
 
@@ -9,7 +9,7 @@
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20007526-blue)](https://doi.org/10.5281/zenodo.20007526)
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.19814975-blue)](https://doi.org/10.5281/zenodo.19814975)
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20194882-blue)](https://doi.org/10.5281/zenodo.20194882)
-[![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.23978022-blue)](https://doi.org/10.5281/zenodo.23978022)
+[![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.24032435-blue)](https://doi.org/10.5281/zenodo.24032435)
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20451155-blue)](https://doi.org/10.5281/zenodo.20451155)
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20453128-blue)](https://doi.org/10.5281/zenodo.20453128)
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.21120913-blue)](https://doi.org/10.5281/zenodo.21120913)
@@ -417,7 +417,7 @@ If you use this software, please cite:
 `
 PAI , Yoon A Limsuwan. "Evolution ONE: Multi‑Level Cancer Evolution & Structural Impact Engine And Epidemiology."
 Zenodo, 2026.
-https://doi.org/10.5281/zenodo.23978022
+https://doi.org/10.5281/zenodo.24032435
 ```
 
 ---
