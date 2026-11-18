@@ -1,5 +1,5 @@
 ``
-# Evolution ONE 367 : Medical AGI : Genetic Editing for Induced Pluripotent Stem Cells: iPSCs , Precision Medicine And More 
+# Evolution ONE 367 : Medical AGI : Genetic Editing for Induced Pluripotent Stem Cells: iPSCs , Precision Medicine , SLE Flare Prediction research Pipeline And More 
 
 **Multi‑Level Cancer Evolution & Structural Impact Engine , Ageing & Longevity Module , High-Performance Epidemiological Forecasting & Viral Evolution Engine  , CRISPR-Cas Therapeutic Design  **
 
