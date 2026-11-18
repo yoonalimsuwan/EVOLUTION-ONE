@@ -1,5 +1,5 @@
 ``
-# Evolution ONE 97 : Medical AGI : Genetic Editing for Induced Pluripotent Stem Cells: iPSCs , Precision Medicine And More 
+# Evolution ONE 367 : Medical AGI : Genetic Editing for Induced Pluripotent Stem Cells: iPSCs , Precision Medicine And More 
 
 **Multi‑Level Cancer Evolution & Structural Impact Engine , Ageing & Longevity Module , High-Performance Epidemiological Forecasting & Viral Evolution Engine  , CRISPR-Cas Therapeutic Design  **
 
@@ -9,7 +9,7 @@
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20007526-blue)](https://doi.org/10.5281/zenodo.20007526)
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.19814975-blue)](https://doi.org/10.5281/zenodo.19814975)
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20194882-blue)](https://doi.org/10.5281/zenodo.20194882)
-[![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.24302739-blue)](https://doi.org/10.5281/zenodo.24302739)
+[![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.24340056-blue)](https://doi.org/10.5281/zenodo.24340056)
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20451155-blue)](https://doi.org/10.5281/zenodo.20451155)
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.20453128-blue)](https://doi.org/10.5281/zenodo.20453128)
 [![Zenodo](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.21120913-blue)](https://doi.org/10.5281/zenodo.21120913)
@@ -603,7 +603,7 @@ If you use this software, please cite:
 `
 PAI , Yoon A Limsuwan. "Evolution ONE: Multi‑Level Cancer Evolution & Structural Impact Engine And Epidemiology."
 Zenodo, 2026.
-https://doi.org/10.5281/zenodo.24302739
+https://doi.org/10.5281/zenodo.24340056
 ```
 
 ---
